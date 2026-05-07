@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Test / generated data
+/data/
+*.txt
+*.out
+*.csv
+*.dat
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude / local agent state
+.claude/
+
+# Sensitive — never commit credential dumps or extracted credentials
+SAFECLOUD*
+*credentials*
+*passwords*
+*dump*
+linkedin.out
