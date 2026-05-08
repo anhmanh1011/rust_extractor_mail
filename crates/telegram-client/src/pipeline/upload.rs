@@ -257,3 +257,145 @@ fn part_path(orig: &Path, idx: u32) -> PathBuf {
     s.push(format!(".part{idx:02}"));
     PathBuf::from(s)
 }
+
+// ── Task 6.5: run (job stream + on_failed callback) ───────────────────────────
+
+/// One unit of upload work emitted by the extract stage.
+///
+/// `caption` is **structured data**, not a pre-rendered string: the
+/// `Part i/N` line is added by `pipeline::upload::run` only when a
+/// split occurs, and `caption::render` is invoked **per part** so
+/// truncation to the 1024-char Telegram cap happens AFTER the Part
+/// line is in place. Never post-concatenate `\nPart i/N` onto a
+/// rendered caption — that bypasses the cap.
+#[derive(Debug, Clone)]
+pub struct UploadJob {
+    /// Content hash of the source extraction; used as the dedup/identity key
+    /// for `UploadOutcome` correlation downstream.
+    pub sha256:      String,
+    /// Local path to the output file produced by the extract stage. May be
+    /// split into multiple part files by `split_for_upload` before upload.
+    pub output_path: PathBuf,
+    /// Structured caption data; rendered per part so the 1024-char cap is
+    /// honored after `Part i/N` is appended.
+    pub caption:     crate::upload::caption::CaptionData,
+}
+
+/// Result emitted on the outbound channel for downstream observers.
+#[derive(Debug, Clone)]
+pub enum UploadOutcome {
+    /// Successful upload. `output_msg_ids` lists the Telegram message ids
+    /// produced by uploading the (possibly split) output, in part order.
+    Done {
+        /// Source extraction hash carried over from the originating `UploadJob`.
+        sha256:         String,
+        /// Output Telegram message ids, one per part, in upload order.
+        output_msg_ids: Vec<i64>,
+    },
+    /// Upload was skipped (e.g. dedup hit). Currently unused by `run`; kept
+    /// for forward-compatibility with the Phase 7 dedup wiring.
+    Skipped {
+        /// Source extraction hash carried over from the originating `UploadJob`.
+        sha256: String,
+        /// Human-readable reason the upload was skipped.
+        reason: String,
+    },
+}
+
+/// Runtime configuration for [`run`].
+#[derive(Debug, Clone)]
+pub struct UploadRunConfig {
+    /// Telegram chat id receiving the uploaded outputs.
+    pub target_chat_id:        i64,
+    /// Per-part size cap in bytes; outputs exceeding this are split via
+    /// [`split_for_upload`] before upload.
+    pub upload_max_size_bytes: u64,
+    /// Inter-job pacing in seconds: after a successful job emits, sleep this
+    /// long before pulling the next job. `0` disables pacing. Failures do
+    /// NOT trigger this sleep — `run` proceeds immediately to the next job.
+    pub upload_rate_seconds:   u64,
+    /// Retry policy passed to [`upload_with_retry`] for each part.
+    pub retry:                 RetryPolicy,
+}
+
+/// Drain `jobs` and upload each output. Emits `UploadOutcome` per job.
+/// Permanent failures invoke `on_failed(job, err)` and are NOT emitted to
+/// `outcomes` (the caller — Phase 7 — re-queues them via `failed_uploads`).
+///
+/// # Errors
+///
+/// Currently always returns `Ok(())` after the input channel closes; the
+/// `Result` return is preserved so future error paths (e.g. fatal client
+/// connection loss) can be surfaced without an API break.
+pub async fn run<C, F>(
+    client:    &C,
+    mut jobs:  tokio::sync::mpsc::Receiver<UploadJob>,
+    outcomes:  tokio::sync::mpsc::Sender<UploadOutcome>,
+    cfg:       &UploadRunConfig,
+    mut on_failed: F,
+) -> Result<()>
+where
+    C: TelegramClient + ?Sized,
+    // `+ 'static` is required because callers pass `run` into
+    // `tokio::spawn(async move { run(...).await })`; the resulting
+    // future captures `on_failed` and must satisfy `Future + 'static`.
+    F: FnMut(UploadJob, anyhow::Error) + Send + 'static,
+{
+    while let Some(job) = jobs.recv().await {
+        let res = upload_job(client, &job, cfg).await;
+        match res {
+            Ok(ids) => {
+                if outcomes
+                    .send(UploadOutcome::Done {
+                        sha256:         job.sha256.clone(),
+                        output_msg_ids: ids,
+                    })
+                    .await
+                    .is_err()
+                {
+                    // Receiver hung up — the consumer is gone, stop draining.
+                    break;
+                }
+                if cfg.upload_rate_seconds > 0 {
+                    tokio::time::sleep(Duration::from_secs(cfg.upload_rate_seconds)).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    sha256 = %job.sha256,
+                    output = %job.output_path.display(),
+                    error = %format!("{e:#}"),
+                    "upload job failed permanently",
+                );
+                on_failed(job, e);
+                // do NOT pace after a failure — proceed to next job immediately.
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn upload_job<C: TelegramClient + ?Sized>(
+    client: &C,
+    job:    &UploadJob,
+    cfg:    &UploadRunConfig,
+) -> Result<Vec<i64>> {
+    let parts = split_for_upload(&job.output_path, cfg.upload_max_size_bytes)
+        .await
+        .with_context(|| format!("split {}", job.output_path.display()))?;
+    let n = parts.len() as u32;
+    let mut ids = Vec::with_capacity(parts.len());
+    for (i, part) in parts.iter().enumerate() {
+        // Render PER PART so the 1024-char truncation in `caption::render`
+        // sees the final caption (including any `Part i/N` line) and the
+        // resulting text never exceeds Telegram's hard cap.
+        let (pi, pt) = if n > 1 { (Some(i as u32 + 1), Some(n)) } else { (None, None) };
+        let input = job.caption.input(pi, pt);
+        let cap = crate::upload::caption::render(&input);
+        let id = upload_with_retry(client, cfg.target_chat_id, part, Some(&cap), &cfg.retry)
+            .await
+            .with_context(|| format!("upload part {} of {}", i + 1, n))?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
