@@ -1,0 +1,23 @@
+[package]
+name         = "extract-mail"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+
+[dependencies]
+anyhow   = { workspace = true }
+clap     = { workspace = true }
+memchr   = { workspace = true }
+memmap2  = { workspace = true }
+rayon    = { workspace = true }
+# extractor-core = { path = "../extractor-core" }   # added in Phase 1
+
+[[bin]]
+name = "extract-mail"
+path = "src/main.rs"
+
+# Keep the synthetic data generator
+[[bin]]
+name = "generate"
+path = "src/bin/generate.rs"

@@ -1,28 +1,28 @@
-# Rust build artifacts
+# Rust
 /target/
+**/target/
 **/*.rs.bk
-*.pdb
+Cargo.lock.bak
 
-# Test / generated data
-/data/
+# Secrets — NEVER commit
+config.toml
+.env
+.env.*
+session.session
+*.session
+
+# Local artefacts
+/out/
+/work_dir/
+*.log
+*.tmp
 *.txt
 *.out
-*.csv
-*.dat
 
-# Editor / OS
-.DS_Store
-.idea/
+# IDE
 .vscode/
-*.swp
-*.swo
+.idea/
 
-# Claude / local agent state
-.claude/
-
-# Sensitive — never commit credential dumps or extracted credentials
-SAFECLOUD*
-*credentials*
-*passwords*
-*dump*
-linkedin.out
+# OS
+.DS_Store
+Thumbs.db

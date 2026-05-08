@@ -1,18 +1,61 @@
-[package]
-name = "extract_mail"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members  = [
+    "crates/extract-mail",
+]
 
-[dependencies]
-anyhow = "1"
-clap = { version = "4", features = ["derive"] }
-memchr = "2"
-memmap2 = "0.9"
-rayon = "1"
+[workspace.package]
+edition      = "2021"
+rust-version = "1.75"
+license      = "MIT"
+
+[workspace.dependencies]
+# Error / utility
+anyhow              = "1"
+thiserror           = "1"
+
+# Async runtime + IO
+tokio               = { version = "1", features = ["rt-multi-thread", "macros", "fs", "sync", "signal", "time", "io-util"] }
+futures             = "0.3"
+bytes               = "1"
+
+# Logging / progress
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender    = "0.2"
+indicatif           = "0.17"
+
+# CLI / config
+clap                = { version = "4", features = ["derive", "env"] }
+serde               = { version = "1", features = ["derive"] }
+toml                = "0.8"
+dirs                = "5"
+
+# Extraction + IO primitives
+memchr              = "2"
+memmap2             = "0.9"
+rayon               = "1"
+
+# Compression
+flate2              = { version = "1", default-features = false, features = ["rust_backend"] }
+zip                 = { version = "0.6", default-features = false, features = ["deflate"] }
+
+# Crypto / state
+sha2                = "0.10"
+rusqlite            = { version = "0.31", features = ["bundled"] }
+tempfile            = "3"
+
+# Telegram
+grammers-client     = "0.6"
+grammers-session    = "0.6"
+grammers-tl-types   = "0.6"
+
+# Dev / test
+proptest            = "1"
 
 [profile.release]
-opt-level = 3
-lto = "fat"
+opt-level     = 3
+lto           = "fat"
 codegen-units = 1
-panic = "abort"
-strip = true
+panic         = "abort"
+strip         = true
