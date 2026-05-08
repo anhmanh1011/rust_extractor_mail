@@ -226,3 +226,42 @@ async fn watch_gap_fills_messages_above_cursor_then_subscribes() {
     assert_eq!(mock.uploaded.lock().unwrap().len(), 4);
     assert_eq!(store.watch_cursor(42).unwrap(), Some(104));
 }
+
+#[tokio::test]
+async fn watch_does_not_advance_cursor_on_per_message_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("store.db")).unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    // The update references chat=42, msg_id=500, but no document is
+    // recorded for that key — `download_stream` returns Err, which
+    // bubbles out of run_with_store_and_client.
+    let info = MessageInfo {
+        chat_id: 42,
+        msg_id: 500,
+        original_name: "ghost.txt".into(),
+        size_bytes: 0,
+        mime: None,
+        date: 1_700_000_000,
+    };
+    let mock = Arc::new(MockClient::new());
+    mock.script_updates(vec![info]);
+
+    let cfg = cfg_for(&out_dir, 7);
+    let args = WatchArgs {
+        duration_seconds: Some(2),
+        confirm_public: false,
+    };
+    run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
+        .await
+        .unwrap();
+
+    // Per-message error logged + skipped → cursor remains None.
+    assert_eq!(
+        store.watch_cursor(42).unwrap(),
+        None,
+        "failing messages must NOT advance the cursor; \
+         gap-fill must re-discover them on next start",
+    );
+}
