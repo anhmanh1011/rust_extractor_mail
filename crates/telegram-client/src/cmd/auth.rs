@@ -55,10 +55,7 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &AuthArgs) -> Result<
         .map_err(|_| anyhow!("is_authorized timed out"))?
         .context("is_authorized")?;
     if already {
-        println!(
-            "Already authorized — session at {}",
-            session_path.display()
-        );
+        println!("Already authorized — session at {}", session_path.display());
         return Ok(());
     }
 
@@ -80,16 +77,16 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &AuthArgs) -> Result<
         .await
         .map_err(|_| anyhow!("get_me timed out"))?
         .context("get_me")?;
+    let user_name = me.full_name();
+    let user_id = me.id();
     println!(
-        "Logged in as {} (id={}). Session saved to {}",
-        me.full_name(),
-        me.id(),
+        "Logged in as {user_name} (id={user_id}). Session saved to {}",
         session_path.display()
     );
 
     tracing::info!(
         session_path = %session_path.display(),
-        user_id = me.id(),
+        user_id,
         "auth complete"
     );
     Ok(())
