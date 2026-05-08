@@ -79,8 +79,51 @@ impl Matcher {
         }
     }
 
-    fn match_url<'a>(&self, _line: &'a [u8]) -> Option<&'a [u8]> {
-        unimplemented!("Task 1.3")
+    /// URL-mode line match. Verbatim port of `extract_url_match` from
+    /// `crates/extract-mail/src/main.rs:184-224`.
+    #[inline]
+    fn match_url<'a>(&self, line: &'a [u8]) -> Option<&'a [u8]> {
+        // 1. Locate "://" — anything without a scheme is not a URL line.
+        let scheme_sep = memchr::memmem::find(line, b"://")?;
+        let host_start = scheme_sep + 3;
+        if host_start >= line.len() {
+            return None;
+        }
+
+        // 2. Host = the run of [a-zA-Z0-9.-] starting at host_start; stops at
+        //    '/', ':', '?', '#', or any other non-host byte.
+        let mut host_end = host_start;
+        while host_end < line.len() {
+            let b = line[host_end];
+            if b.is_ascii_alphanumeric() || b == b'.' || b == b'-' {
+                host_end += 1;
+            } else {
+                break;
+            }
+        }
+        let host = &line[host_start..host_end];
+
+        // 3. Domain-aware suffix match against the key.
+        if host.len() < self.key.len() || !matches_suffix(host, &self.key) {
+            return None;
+        }
+
+        // 4. Find <email>:<password> as the LAST two ':'-separated fields.
+        //    Reading from the right is robust against ':' inside the URL
+        //    (port, path, query). Layout: `<URL>:<email>:<password>`, so the
+        //    second-to-last ':' marks the start of <email>.
+        let last_colon = memchr::memrchr(b':', line)?;
+        if last_colon == 0 {
+            return None;
+        }
+        let second_last_colon = memchr::memrchr(b':', &line[..last_colon])?;
+        // Both colons must lie strictly after the host. Otherwise the line has
+        // no <email>:<password> tail (only a URL with optional port), and we
+        // reject by returning None — matching the original's behavior.
+        if second_last_colon < host_end {
+            return None;
+        }
+        Some(&line[second_last_colon + 1..])
     }
 
     /// The canonical (lowercased ASCII) key bytes.
