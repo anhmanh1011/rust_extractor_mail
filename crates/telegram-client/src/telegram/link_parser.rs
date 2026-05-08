@@ -12,7 +12,7 @@ pub enum MessageRef {
         /// Numeric message id within the channel.
         msg_id: i32,
     },
-    /// Private channel: chat_id is the t.me/c/<N> internal id with -100 prefix.
+    /// Private channel: chat_id is the `t.me/c/<N>` internal id with `-100` prefix.
     ChatId {
         /// MTProto chat_id: `-(1_000_000_000_000 + internal_id)`, the canonical
         /// channel-id form Telegram derives from a `t.me/c/<internal_id>` link.
@@ -23,9 +23,9 @@ pub enum MessageRef {
 }
 
 /// Parse a t.me message link. Accepted forms:
-///   https://t.me/<username>/<msg_id>
-///   https://t.me/c/<internal_id>/<msg_id>
-///   tg://resolve?domain=<username>&post=<msg_id>
+/// - `https://t.me/<username>/<msg_id>`
+/// - `https://t.me/c/<internal_id>/<msg_id>`
+/// - `tg://resolve?domain=<username>&post=<msg_id>`
 pub fn parse_message_link(s: &str) -> Result<MessageRef> {
     if let Some(rest) = s.strip_prefix("tg://resolve?") {
         let mut domain = None;

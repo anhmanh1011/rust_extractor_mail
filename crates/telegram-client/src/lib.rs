@@ -10,3 +10,8 @@ pub mod telegram;
 pub mod pipeline;
 pub mod store;
 pub mod cmd;
+
+// Convenience re-exports — the canonical paths still live under `telegram::*`,
+// these just shorten the most common imports for downstream callers.
+pub use telegram::{ChatRef, Dialog, DialogKind, MessageInfo, TelegramClient};
+pub use telegram::mock::MockClient;
