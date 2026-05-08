@@ -1,0 +1,43 @@
+# tg-extract example configuration. Copy to config.toml and edit.
+# Secrets (TG_API_ID, TG_API_HASH) come from environment variables;
+# see README and spec section 7 for details.
+
+[telegram]
+session_path                = "~/.config/tg-extract/session.session"
+download_concurrent_chunks  = 4
+
+[telegram.output]
+chat = "@my_results_channel"     # OR  chat_id = -1001234567890
+
+[pipeline]
+work_dir                      = "~/.local/share/tg-extract"
+output_dir                    = "./out"
+chunk_bytes                   = 1048576
+intra_file_channel_capacity   = 4
+inter_file_channel_capacity   = 1
+upload_channel_capacity       = 2
+max_line_bytes                = 65536
+upload_rate_seconds           = 3
+upload_max_size_bytes         = 2147483648
+max_uncompressed_bytes        = 10737418240   # 10 GB zip-bomb guard
+
+[extract]
+mode = "plain"                   # "plain" | "url"
+key  = "gmail.com"
+
+[[watch.channel]]
+chat = "@dump_channel_a"
+
+[[watch.channel]]
+chat_id = -1001999888777
+# extract = { mode = "url", key = "linkedin.com" }   # optional override
+
+[backfill]
+page_size = 100
+since     = "2024-01-01T00:00:00Z"
+
+[log]
+level    = "info"
+format   = "human"               # "human" | "json"
+file     = "~/.local/share/tg-extract/log/app.log"
+rotation = "daily"               # "never" | "daily" | "hourly"
