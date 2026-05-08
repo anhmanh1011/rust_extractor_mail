@@ -416,8 +416,8 @@ async fn handle_stream(
     let hash_tx_first = hash_tx.clone();
     let teer = tokio::spawn(async move {
         if !first.is_empty() {
-            let _ = pipe_tx_first.send(first.clone()).await;
-            let _ = hash_tx_first.send(first).await;
+            if pipe_tx_first.send(first.clone()).await.is_err() { return; }
+            if hash_tx_first.send(first).await.is_err()         { return; }
         }
         while let Some(item) = chunks.recv().await {
             match item {
