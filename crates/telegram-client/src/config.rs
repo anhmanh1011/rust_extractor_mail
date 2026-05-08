@@ -214,14 +214,24 @@ pub fn expand_path(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-/// Secrets-only struct loaded from environment. A redacting `Debug` impl
-/// will be added in Task 2.4 so accidental logging cannot leak the hash.
+/// Telegram API credentials loaded from env. `api_hash` is redacted from
+/// `Debug` output to prevent log leaks. `Display` is intentionally not
+/// implemented so `{}` formatting cannot embed the value either. Spec §7.4.
 #[derive(Clone)]
 pub struct Secrets {
     /// Telegram API id (from `TG_API_ID`).
     pub api_id: i32,
     /// Telegram API hash (from `TG_API_HASH`, 32 ASCII hex chars).
     pub api_hash: String,
+}
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets")
+            .field("api_id", &self.api_id)
+            .field("api_hash", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Load `Secrets` from the `TG_API_ID` and `TG_API_HASH` environment vars.
