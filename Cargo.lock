@@ -190,9 +190,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "extractor-core",
  "memchr",
  "memmap2",
  "rayon",
+ "tempfile",
 ]
 
 [[package]]

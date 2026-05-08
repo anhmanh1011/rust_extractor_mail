@@ -11,7 +11,10 @@ clap     = { workspace = true }
 memchr   = { workspace = true }
 memmap2  = { workspace = true }
 rayon    = { workspace = true }
-# extractor-core = { path = "../extractor-core" }   # added in Phase 1
+extractor-core = { path = "../extractor-core" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
 
 [[bin]]
 name = "extract-mail"
