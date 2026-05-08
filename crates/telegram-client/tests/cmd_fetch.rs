@@ -1,9 +1,9 @@
-//! End-to-end tests for `cmd::fetch::run_with_client` (Task 4.7).
+//! End-to-end tests for `cmd::fetch::run_with_client` (Task 4.7 + Task 5.2).
 //!
 //! Covers:
 //! - Plain-text stream: only matching lines written to expected path.
 //! - Gzip stream: decoded then extracted.
-//! - Zip stream: returns "zip not yet implemented (Phase 5)" error.
+//! - Zip disk-spill: all text entries are extracted into a single merged output.
 //! - Link resolution: `https://t.me/<username>/<id>` resolves via mock dialogs.
 
 use std::sync::Arc;
@@ -53,6 +53,24 @@ fn cfg(out_dir: &std::path::Path) -> AppConfig {
             rotation: "never".into(),
         },
     }
+}
+
+/// Build a real zip archive byte-buffer with the given (name, body) entries.
+fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    use std::io::Write;
+    use zip::write::FileOptions;
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut buf);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let opts = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        for (name, body) in entries {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    buf
 }
 
 #[tokio::test]
@@ -142,36 +160,39 @@ c@c.com:p3
 }
 
 #[tokio::test]
-async fn fetch_zip_returns_phase5_error_in_phase4() {
-    // ZIP local file header magic: PK
-    let zip_local_header = [0x50u8, 0x4B, 0x03, 0x04, 0x00, 0x00, 0x00, 0x00];
+async fn fetch_zip_extracts_all_text_entries() {
+    // Build a real zip with two .txt entries; the disk-spill path
+    // (`pipeline::disk::disk_extract`) must spill, open, decompress each
+    // entry, and merge matching lines into a single output file.
+    let zip_bytes = build_zip(&[
+        ("a.txt", b"target.com:alice@x.com:p1\nnoise\n"),
+        ("b.txt", b"noise\ntarget.com:bob@y.com:p2\n"),
+    ]);
+
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockClient::new().with_document(
         MessageInfo {
-            chat_id: 1,
-            msg_id: 1,
+            chat_id: 7,
+            msg_id: 7,
             file_name: "dump.zip".into(),
-            size: 8,
+            size: zip_bytes.len() as u64,
             mime: None,
         },
-        Vec::new(),
+        Vec::new(), // bytes unused -- script takes precedence
     ));
-    mock.script_download(1, 1, vec![Ok(Bytes::copy_from_slice(&zip_local_header))]);
+    mock.script_download(7, 7, vec![Ok(Bytes::from(zip_bytes))]);
 
     let cfg = cfg(tmp.path());
     let args = FetchArgs {
         link: None,
-        chat: Some(1),
-        msg_id: Some(1),
+        chat: Some(7),
+        msg_id: Some(7),
     };
-    let err = run_with_client(&cfg, &args, mock.as_ref())
-        .await
-        .unwrap_err();
-    let msg = format!("{err:#}");
-    assert!(
-        msg.contains("zip not yet implemented") || msg.contains("Phase 5"),
-        "expected zip-phase5 error, got: {msg}",
-    );
+    run_with_client(&cfg, &args, mock.as_ref()).await.unwrap();
+
+    let out_path = tmp.path().join("7").join("7_dump.out");
+    let content = std::fs::read(&out_path).unwrap();
+    assert_eq!(content, b"alice@x.com:p1\nbob@y.com:p2\n");
 }
 
 #[tokio::test]

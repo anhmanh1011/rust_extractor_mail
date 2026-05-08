@@ -14,10 +14,11 @@ use extractor_core::Matcher;
 
 use crate::config::{AppConfig, ExtractMode, Secrets};
 use crate::output::{join_safe, sanitize};
+use crate::pipeline::disk::disk_extract;
 use crate::pipeline::stream::stream_extract;
 use crate::pipeline::{detect_format, Format};
 use crate::telegram::link_parser::{parse_message_link, MessageRef};
-use crate::telegram::{ChatRef, TelegramClient};
+use crate::telegram::{ChatRef, MessageInfo, TelegramClient};
 
 /// Arguments for `tg-extract fetch`.
 #[derive(Args, Debug)]
@@ -57,11 +58,9 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &FetchArgs) -> Result
 /// 2. Resolve `--link` or `(--chat, --msg-id)` to `(chat_id, msg_id)`.
 /// 3. Fetch [`MessageInfo`] for the target message.
 /// 4. Open a `download_stream` and peek the first chunk for format detection.
-/// 5. Route the stream through `stream_extract` (plain or gzip decoder).
+/// 5. Route the stream through `stream_extract` for `.txt`/`.gz`, or
+///    `disk_extract` for `.zip` (disk-spill path).
 /// 6. Write matched lines to `<output_dir>/<chat_id>/<msg_id>_<sanitized_name>.out`.
-///
-/// `.zip` files return an error with `"zip not yet implemented (Phase 5)"` --
-/// the disk-spill path is wired in Phase 5.
 ///
 /// [`MessageInfo`]: crate::telegram::MessageInfo
 pub async fn run_with_client<C: TelegramClient>(
@@ -100,27 +99,15 @@ pub async fn run_with_client<C: TelegramClient>(
     };
     let format = detect_format(&info.file_name, &first_chunk);
 
-    let is_gzip = match format {
-        Format::Txt => false,
-        Format::Gz => true,
-        Format::Zip => bail!("zip not yet implemented (Phase 5): {}", info.file_name),
-        Format::Unknown => bail!(
-            "unknown format for {} (extension + magic both inconclusive)",
-            info.file_name
-        ),
-    };
-
-    // Re-prepend the first_chunk so the extractor sees the full stream.
-    // A fresh bounded channel bridges the tokio Receiver<Result<Bytes>>
-    // to the stream_extract API which expects plain Receiver<Bytes>.
+    // Bridge the upstream Receiver<Result<Bytes>> to a plain Receiver<Bytes>,
+    // re-prepending the already-peeked first chunk so the extractor sees the
+    // full stream.
     let cap = cfg.pipeline.intra_file_channel_capacity;
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(cap);
     tokio::spawn(async move {
-        // Forward the already-peeked first chunk.
         if !first_chunk.is_empty() && tx.send(first_chunk).await.is_err() {
             return;
         }
-        // Forward remaining chunks, stopping on upstream or downstream error.
         while let Some(item) = chunks.recv().await {
             match item {
                 Ok(b) => {
@@ -128,19 +115,39 @@ pub async fn run_with_client<C: TelegramClient>(
                         return;
                     }
                 }
-                // Upstream error: stop pumping; stream_extract observes EOF.
+                // Upstream error: stop pumping; downstream observes EOF.
                 Err(_) => return,
             }
         }
-        // tx dropped here -> stream_extract observes None / clean EOF.
     });
 
-    // Build matcher and output file, then run the extraction.
     let matcher = Arc::new(
         Matcher::new(&cfg.extract.key, mode_for_extract(cfg.extract.mode))
             .context("Matcher::new")?,
     );
-    let writer = std::fs::File::create(&out_path)
+
+    match format {
+        Format::Txt => run_stream_path(cfg, &info, &out_path, rx, matcher, false).await,
+        Format::Gz => run_stream_path(cfg, &info, &out_path, rx, matcher, true).await,
+        Format::Zip => run_disk_path(cfg, &info, &out_path, rx, matcher).await,
+        Format::Unknown => bail!(
+            "unknown format for {} (extension + magic both inconclusive)",
+            info.file_name
+        ),
+    }
+}
+
+/// Stream-extract path: in-memory pipeline through `stream_extract`.
+/// Used for `.txt` (plain) and `.gz` (gzip) sources.
+async fn run_stream_path(
+    cfg: &AppConfig,
+    info: &MessageInfo,
+    out_path: &Path,
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    matcher: Arc<Matcher>,
+    is_gzip: bool,
+) -> Result<()> {
+    let writer = std::fs::File::create(out_path)
         .with_context(|| format!("create {}", out_path.display()))?;
     let (_file, stats) = stream_extract(rx, matcher, cfg.pipeline.max_line_bytes, writer, is_gzip)
         .await
@@ -148,16 +155,49 @@ pub async fn run_with_client<C: TelegramClient>(
     // _file (the File handle) is dropped here, flushing and closing the fd.
 
     tracing::info!(
-        chat_id,
-        msg_id,
-        file_name  = %info.file_name,
-        out        = %out_path.display(),
+        chat_id   = info.chat_id,
+        msg_id    = info.msg_id,
+        file_name = %info.file_name,
+        out       = %out_path.display(),
         lines_scanned = stats.lines_scanned,
         lines_matched = stats.lines_matched,
         bytes_scanned = stats.bytes_scanned,
-        "fetch complete",
+        "fetch complete (stream)",
     );
+    Ok(())
+}
 
+/// Disk-spill path: spool the archive to a tempfile, then iterate its entries
+/// through `disk_extract`. Used for `.zip` sources.
+async fn run_disk_path(
+    cfg: &AppConfig,
+    info: &MessageInfo,
+    out_path: &Path,
+    rx: tokio::sync::mpsc::Receiver<Bytes>,
+    matcher: Arc<Matcher>,
+) -> Result<()> {
+    let stats = disk_extract(
+        rx,
+        matcher,
+        cfg.pipeline.max_line_bytes,
+        cfg.pipeline.max_uncompressed_bytes,
+        out_path,
+    )
+    .await
+    .with_context(|| format!("disk_extract for {}", out_path.display()))?;
+
+    tracing::info!(
+        chat_id   = info.chat_id,
+        msg_id    = info.msg_id,
+        file_name = %info.file_name,
+        out       = %out_path.display(),
+        lines_scanned = stats.lines_scanned,
+        lines_matched = stats.lines_matched,
+        bytes_scanned = stats.bytes_scanned,
+        entries_processed = stats.entries_processed,
+        entries_skipped = stats.entries_skipped,
+        "fetch complete (disk-spill)",
+    );
     Ok(())
 }
 
