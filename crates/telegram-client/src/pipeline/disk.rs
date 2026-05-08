@@ -107,14 +107,14 @@ pub async fn disk_extract<P: AsRef<Path>>(
     // 3. Open + extract on a blocking thread (zip + scan are CPU work).
     //    The `spill` `NamedTempFile` is moved into this closure so its
     //    Drop (which deletes the file) runs after the archive is closed.
-    let result = tokio::task::spawn_blocking(move || -> Result<DiskExtractStats> {
+    let cleanup_path = out_path.clone();
+    let join = tokio::task::spawn_blocking(move || -> Result<DiskExtractStats> {
         let mut spill = spill;
         spill
             .as_file_mut()
             .seek(SeekFrom::Start(0))
             .context("seek 0")?;
-        let reader =
-            BufReader::with_capacity(READ_BUFFER, spill.reopen().context("reopen spill")?);
+        let reader = BufReader::with_capacity(READ_BUFFER, spill.reopen().context("reopen spill")?);
         let mut archive = zip::ZipArchive::new(reader).context("ZipArchive::new")?;
 
         let writer = OpenOptions::new()
@@ -136,7 +136,10 @@ pub async fn disk_extract<P: AsRef<Path>>(
             // Inspect entry name without trusting it as a path.
             let name = match archive.by_index_raw(i) {
                 Ok(e) => e.name().to_string(),
-                Err(_) => continue,
+                Err(e) => {
+                    tracing::warn!("zip by_index_raw({i}): {e}");
+                    continue;
+                }
             };
             // Take the basename (last path component) separator-agnostically
             // so the extension check works for both Unix ("a/b.txt") and
@@ -186,9 +189,7 @@ pub async fn disk_extract<P: AsRef<Path>>(
             let s = scanner
                 .finish(&mut sink)
                 .context("scanner.finish (entry)")?;
-            entry_stats.lines_scanned += s.lines_scanned;
-            entry_stats.lines_matched += s.lines_matched;
-            entry_stats.bytes_scanned += s.bytes_scanned;
+            entry_stats += s;
 
             total.lines_scanned += entry_stats.lines_scanned;
             total.lines_matched += entry_stats.lines_matched;
@@ -199,11 +200,27 @@ pub async fn disk_extract<P: AsRef<Path>>(
         sink.flush().context("flush sink")?;
         // RAII: spill goes out of scope here → file deleted.
         Ok(total)
-    })
-    .await
-    .context("disk extract task panicked")??;
+    });
 
-    Ok(result)
+    let inner = join.await.context("disk extract task panicked")?;
+    match inner {
+        Ok(stats) => Ok(stats),
+        Err(e) => {
+            // Best-effort: remove the (possibly partial) merged output so
+            // the next attempt does not append to confusing leftovers.
+            // Failure to remove (e.g. file never created) is not fatal.
+            if let Err(rm_err) = std::fs::remove_file(&cleanup_path) {
+                if rm_err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        "failed to remove partial output {}: {}",
+                        cleanup_path.display(),
+                        rm_err,
+                    );
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 fn scan_into<R: Read, W: Write>(
@@ -227,8 +244,6 @@ fn scan_into<R: Read, W: Write>(
         let s = scanner
             .feed(&buf[..n], sink)
             .context("scanner.feed (entry)")?;
-        stats.lines_scanned += s.lines_scanned;
-        stats.lines_matched += s.lines_matched;
-        stats.bytes_scanned += s.bytes_scanned;
+        *stats += s;
     }
 }

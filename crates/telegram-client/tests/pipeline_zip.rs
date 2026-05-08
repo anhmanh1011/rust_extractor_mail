@@ -42,7 +42,9 @@ async fn three_text_entries_extracted_in_order() {
 
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("merged.out");
-    let stats = disk_extract(rx, m, MAX_LINE_BYTES, TEN_GB, &out).await.unwrap();
+    let stats = disk_extract(rx, m, MAX_LINE_BYTES, TEN_GB, &out)
+        .await
+        .unwrap();
 
     assert_eq!(stats.lines_matched, 2);
     assert_eq!(stats.entries_processed, 3);
@@ -67,7 +69,9 @@ async fn nontext_entries_skipped_without_failing() {
 
     let tmp = tempfile::tempdir().unwrap();
     let out = tmp.path().join("merged.out");
-    let stats = disk_extract(rx, m, MAX_LINE_BYTES, TEN_GB, &out).await.unwrap();
+    let stats = disk_extract(rx, m, MAX_LINE_BYTES, TEN_GB, &out)
+        .await
+        .unwrap();
     assert_eq!(stats.entries_processed, 1);
     assert_eq!(stats.entries_skipped, 2);
     assert_eq!(std::fs::read(&out).unwrap(), b"hit@x.com:p\n");
@@ -151,4 +155,38 @@ async fn entry_with_traversal_filename_is_neutralised() {
     assert_eq!(std::fs::read(&out).unwrap(), b"hit@x.com:p\n");
     // No file under /etc, no file at tmp/../etc, etc. (negative assertion
     // is structural — disk_extract never opens an entry-named file.)
+}
+
+#[tokio::test]
+async fn aborted_extract_removes_partial_output() {
+    use std::io::Write;
+    use zip::write::FileOptions;
+    let body_e1 = b"target.com:hit1@x.com:p1\ntarget.com:hit2@x.com:p2\n";
+    let body_e2 = vec![b'A'; 8 * 1024];
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("a.txt", opts).unwrap();
+        zip.write_all(body_e1).unwrap();
+        zip.start_file("b.txt", opts).unwrap();
+        zip.write_all(&body_e2).unwrap();
+        zip.finish().unwrap();
+    }
+    let m = Arc::new(Matcher::new("target.com", Mode::Plain).unwrap());
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tx.send(Bytes::from(buf)).await.unwrap();
+    drop(tx);
+    let tmp = tempfile::tempdir().unwrap();
+    let out = tmp.path().join("partial.out");
+    let cap_below_e2 = 4 * 1024;
+    let err = disk_extract(rx, m, MAX_LINE_BYTES, cap_below_e2, &out)
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("max_uncompressed_bytes"));
+    assert!(
+        !out.exists(),
+        "partial output {} must be removed on abort",
+        out.display(),
+    );
 }
