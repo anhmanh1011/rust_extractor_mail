@@ -118,6 +118,13 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
     //     Spec §6.4: between watch_cursor's last write and process restart,
     //     messages posted to subscribed chats would be missed by
     //     subscribe_updates alone — close that window here.
+    //
+    //     v1 limitation: `stack` is unbounded — a long outage on a high-
+    //     volume channel (millions of messages above cursor) will buffer the
+    //     full gap before processing. Acceptable in v1 because each
+    //     `MessageInfo` is ~100 bytes and the spec §6.4 recovery model
+    //     assumes operator restart cadence on the order of hours, not weeks.
+    //     A page-by-page processing variant is tracked for future hardening.
     for &chat_id in &chat_ids {
         let cursor = store
             .watch_cursor(chat_id)
@@ -157,6 +164,9 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
 
         // Process oldest-first so cursor advances monotonically.
         stack.reverse();
+        // `chat_id` is loop-invariant inside this inner pass; build the
+        // cursor title once per outer iteration to skip a per-message alloc.
+        let title = format!("chat:{chat_id}");
         for info in stack {
             let synth = crate::cmd::fetch::FetchArgs {
                 link:           None,
@@ -171,7 +181,6 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
                 .await
             {
                 Ok(()) => {
-                    let title = format!("chat:{cid}");
                     if let Err(e) = store.update_watch_cursor(cid, &title, i64::from(mid)) {
                         tracing::error!(
                             ?e,
