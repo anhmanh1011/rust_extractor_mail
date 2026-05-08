@@ -50,7 +50,30 @@ async fn main() -> Result<()> {
         }
         Cmd::Watch(args)           => telegram_client::cmd::watch::run(&cfg, &secrets, &args).await,
         Cmd::Backfill(args)        => telegram_client::cmd::backfill::run(&cfg, &secrets, &args).await,
-        Cmd::RetryUploads          => telegram_client::cmd::retry_uploads::run(&cfg, &secrets).await,
+        Cmd::RetryUploads          => {
+            let target = match (cfg.telegram.output.chat_id, cfg.telegram.output.chat.as_deref()) {
+                (Some(id), _) => id,
+                (None, Some(_)) => anyhow::bail!(
+                    "retry-uploads requires telegram.output.chat_id (numeric); \
+                     username-only output is rejected here for safety",
+                ),
+                _ => anyhow::bail!("retry-uploads: telegram.output.chat_id is not configured"),
+            };
+            let upload_cfg = telegram_client::pipeline::upload::UploadRunConfig {
+                target_chat_id:        target,
+                upload_max_size_bytes: cfg.pipeline.upload_max_size_bytes,
+                upload_rate_seconds:   cfg.pipeline.upload_rate_seconds,
+                retry: telegram_client::pipeline::upload::RetryPolicy::default(),
+            };
+            let client = telegram_client::telegram::client::GrammersClient::connect(
+                secrets.api_id,
+                &secrets.api_hash,
+                std::path::Path::new(&cfg.telegram.session_path),
+            )
+            .await
+            .context("GrammersClient::connect")?;
+            telegram_client::cmd::retry_uploads::run_with_store_and_client(&store, &client, &upload_cfg).await
+        }
         Cmd::Stats                 => telegram_client::cmd::stats::run(&cfg).await,
     }
 }
