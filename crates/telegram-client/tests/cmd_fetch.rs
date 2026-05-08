@@ -18,13 +18,18 @@ use telegram_client::telegram::mock::MockClient;
 use telegram_client::telegram::{Dialog, DialogKind, MessageInfo};
 
 /// Build a minimal valid [`AppConfig`] rooted at `out_dir`.
+///
+/// Default `output.chat`/`chat_id` are both `None`; tests that exercise the
+/// upload step explicitly set one (or both) on the returned `AppConfig`.
+/// Leaving them `None` here keeps existing extract-only tests from tripping
+/// the public-chat gate or attempting an upload they don't script.
 fn cfg(out_dir: &std::path::Path) -> AppConfig {
     AppConfig {
         telegram: TelegramSection {
             session_path: out_dir.join(".session").to_string_lossy().into_owned(),
             download_concurrent_chunks: 4,
             output: OutputSection {
-                chat: Some("me".into()),
+                chat: None,
                 chat_id: None,
             },
         },
@@ -102,6 +107,8 @@ target.com:carol@z.com:p3
         link: None,
         chat: Some(42),
         msg_id: Some(7),
+        no_upload: false,
+        confirm_public: false,
     };
     run_with_client(&cfg, &args, mock.as_ref()).await.unwrap();
 
@@ -146,6 +153,8 @@ target.com:c@c.com:p3
         link: None,
         chat: Some(1),
         msg_id: Some(1),
+        no_upload: false,
+        confirm_public: false,
     };
     run_with_client(&cfg, &args, mock.as_ref()).await.unwrap();
 
@@ -187,6 +196,8 @@ async fn fetch_zip_extracts_all_text_entries() {
         link: None,
         chat: Some(7),
         msg_id: Some(7),
+        no_upload: false,
+        confirm_public: false,
     };
     run_with_client(&cfg, &args, mock.as_ref()).await.unwrap();
 
@@ -233,6 +244,8 @@ async fn fetch_link_resolves_to_chat_and_msg_id() {
         link: Some("https://t.me/foochan/12".into()),
         chat: None,
         msg_id: None,
+        no_upload: false,
+        confirm_public: false,
     };
     run_with_client(&cfg, &args, mock.as_ref()).await.unwrap();
 
@@ -242,4 +255,206 @@ async fn fetch_link_resolves_to_chat_and_msg_id() {
         b"user@x.com:pwd
 "
     );
+}
+
+// ── Task 6.6: upload-into-cmd::fetch tests ───────────────────────────────────
+
+#[tokio::test]
+async fn fetch_uploads_to_configured_chat_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockClient::new().with_document(
+        MessageInfo {
+            chat_id: 42,
+            msg_id: 7,
+            file_name: "dump.txt".into(),
+            size: 1_000,
+            mime: None,
+        },
+        Vec::new(), // bytes unused -- script takes precedence
+    ));
+    mock.script_download(
+        42,
+        7,
+        vec![Ok(Bytes::from_static(b"target.com:alice@x.com:p1\n"))],
+    );
+    mock.script_upload(vec![telegram_client::telegram::mock::UploadOutcome::Ok(
+        909,
+    )]);
+
+    let mut cfg = cfg(tmp.path());
+    cfg.telegram.output.chat = None;
+    cfg.telegram.output.chat_id = Some(-1001234567890);
+
+    let args = FetchArgs {
+        link: None,
+        chat: Some(42),
+        msg_id: Some(7),
+        no_upload: false,
+        confirm_public: false,
+    };
+    run_with_client(&cfg, &args, mock.as_ref()).await.unwrap();
+
+    let uploads = mock.uploaded.lock().unwrap();
+    assert_eq!(uploads.len(), 1, "expected one upload, got {uploads:?}");
+    let (target_chat, ref path, ref caption, msg_id) = uploads[0];
+    assert_eq!(target_chat, -1001234567890);
+    assert!(path.ends_with("7_dump.out"), "{path:?}");
+    let cap = caption.as_deref().unwrap_or("");
+    assert!(cap.contains("dump.txt"), "caption = {cap}");
+    assert_eq!(msg_id, 909);
+}
+
+#[tokio::test]
+async fn fetch_skips_upload_when_no_upload_flag_set() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockClient::new().with_document(
+        MessageInfo {
+            chat_id: 1,
+            msg_id: 1,
+            file_name: "x.txt".into(),
+            size: 10,
+            mime: None,
+        },
+        Vec::new(),
+    ));
+    mock.script_download(
+        1,
+        1,
+        vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
+    );
+
+    let mut cfg = cfg(tmp.path());
+    cfg.telegram.output.chat_id = Some(-1001234567890);
+
+    let args = FetchArgs {
+        link: None,
+        chat: Some(1),
+        msg_id: Some(1),
+        no_upload: true,
+        confirm_public: false,
+    };
+    run_with_client(&cfg, &args, mock.as_ref()).await.unwrap();
+    assert!(
+        mock.uploaded.lock().unwrap().is_empty(),
+        "no upload expected"
+    );
+}
+
+#[tokio::test]
+async fn fetch_aborts_on_public_chat_without_confirm() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockClient::new().with_document(
+        MessageInfo {
+            chat_id: 1,
+            msg_id: 1,
+            file_name: "x.txt".into(),
+            size: 10,
+            mime: None,
+        },
+        Vec::new(),
+    ));
+    mock.script_download(
+        1,
+        1,
+        vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
+    );
+
+    let mut cfg = cfg(tmp.path());
+    cfg.telegram.output.chat = Some("@public_chan".into());
+    cfg.telegram.output.chat_id = None;
+
+    let args = FetchArgs {
+        link: None,
+        chat: Some(1),
+        msg_id: Some(1),
+        no_upload: false,
+        confirm_public: false,
+    };
+    let err = run_with_client(&cfg, &args, mock.as_ref())
+        .await
+        .unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("--confirm-public"), "got: {msg}");
+}
+
+#[tokio::test]
+async fn fetch_aborts_on_bare_username_without_confirm() {
+    // A `chat` value with no leading '@' that ALSO doesn't parse as a
+    // numeric chat id is treated as public per spec §11.2 -- covers
+    // "my_channel" or "Some Title" typos.
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockClient::new().with_document(
+        MessageInfo {
+            chat_id: 1,
+            msg_id: 1,
+            file_name: "x.txt".into(),
+            size: 10,
+            mime: None,
+        },
+        Vec::new(),
+    ));
+    mock.script_download(
+        1,
+        1,
+        vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
+    );
+
+    let mut cfg = cfg(tmp.path());
+    cfg.telegram.output.chat = Some("my_channel".into());
+    cfg.telegram.output.chat_id = None;
+
+    let args = FetchArgs {
+        link: None,
+        chat: Some(1),
+        msg_id: Some(1),
+        no_upload: false,
+        confirm_public: false,
+    };
+    let err = run_with_client(&cfg, &args, mock.as_ref())
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("--confirm-public"));
+}
+
+#[tokio::test]
+async fn fetch_does_not_gate_numeric_chat_string() {
+    // `chat = "-1001234567890"` is a private channel id stored as a
+    // string. It MUST NOT trigger the public-chat gate. The `chat_id`
+    // numeric field is the canonical form, but accepting numeric
+    // strings here matches how some configs are templated.
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockClient::new().with_document(
+        MessageInfo {
+            chat_id: 1,
+            msg_id: 1,
+            file_name: "x.txt".into(),
+            size: 10,
+            mime: None,
+        },
+        Vec::new(),
+    ));
+    mock.script_download(
+        1,
+        1,
+        vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
+    );
+    mock.script_upload(vec![telegram_client::telegram::mock::UploadOutcome::Ok(7)]);
+
+    let mut cfg = cfg(tmp.path());
+    cfg.telegram.output.chat = Some("-1001234567890".into());
+    cfg.telegram.output.chat_id = None;
+
+    let args = FetchArgs {
+        link: None,
+        chat: Some(1),
+        msg_id: Some(1),
+        no_upload: false,
+        confirm_public: false,
+    };
+    run_with_client(&cfg, &args, mock.as_ref())
+        .await
+        .expect("numeric-string chat must not trigger public gate");
+    let uploads = mock.uploaded.lock().unwrap();
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].0, -1001234567890);
 }

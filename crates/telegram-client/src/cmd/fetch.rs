@@ -34,6 +34,25 @@ pub struct FetchArgs {
     /// Numeric message id within the chat. Requires `--chat`.
     #[arg(long = "msg-id", requires = "chat")]
     pub msg_id: Option<i32>,
+
+    /// Do not upload the produced output to `telegram.output.chat`.
+    #[arg(long, default_value_t = false)]
+    pub no_upload: bool,
+
+    /// Acknowledge that `telegram.output.chat` is a public chat (`@username`
+    /// or any non-numeric handle). Required by spec §11.2 to avoid an
+    /// accidental public credential leak.
+    #[arg(long, default_value_t = false)]
+    pub confirm_public: bool,
+}
+
+/// Subset of extractor stats the upload caption needs. Both extract paths
+/// (`stream_extract` and `disk_extract`) return their own stats struct;
+/// this is the common projection used to build [`crate::upload::caption::CaptionData`].
+#[derive(Debug, Clone, Copy)]
+struct CaptionStats {
+    lines_scanned: u64,
+    lines_matched: u64,
 }
 
 /// Top-level entry point invoked by `main.rs`. Constructs a real
@@ -61,6 +80,10 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &FetchArgs) -> Result
 /// 5. Route the stream through `stream_extract` for `.txt`/`.gz`, or
 ///    `disk_extract` for `.zip` (disk-spill path).
 /// 6. Write matched lines to `<output_dir>/<chat_id>/<msg_id>_<sanitized_name>.out`.
+/// 7. Optionally upload that output to `cfg.telegram.output.{chat,chat_id}`
+///    via [`crate::pipeline::upload::run`] (skipped when `args.no_upload`
+///    is set or no output chat is configured). Public-chat targets require
+///    `--confirm-public` per spec §11.2.
 ///
 /// [`MessageInfo`]: crate::telegram::MessageInfo
 pub async fn run_with_client<C: TelegramClient>(
@@ -126,15 +149,77 @@ pub async fn run_with_client<C: TelegramClient>(
             .context("Matcher::new")?,
     );
 
-    match format {
-        Format::Txt => run_stream_path(cfg, &info, &out_path, rx, matcher, false).await,
-        Format::Gz => run_stream_path(cfg, &info, &out_path, rx, matcher, true).await,
-        Format::Zip => run_disk_path(cfg, &info, &out_path, rx, matcher).await,
+    let stats: CaptionStats = match format {
+        Format::Txt => run_stream_path(cfg, &info, &out_path, rx, matcher, false).await?,
+        Format::Gz => run_stream_path(cfg, &info, &out_path, rx, matcher, true).await?,
+        Format::Zip => run_disk_path(cfg, &info, &out_path, rx, matcher).await?,
         Format::Unknown => bail!(
             "unknown format for {} (extension + magic both inconclusive)",
             info.file_name
         ),
+    };
+
+    // Phase 6: optional upload to telegram.output.chat. Order matters:
+    // `resolve_output_chat` runs the public-chat gate FIRST, then resolves,
+    // so users get a clear error before any network resolve is attempted.
+    if !args.no_upload {
+        if let Some(target_chat_id) = resolve_output_chat(cfg, args, client).await? {
+            let caption_data = crate::upload::caption::CaptionData {
+                original_name: info.file_name.clone(),
+                source_chat_id: chat_id,
+                source_msg_id: msg_id,
+                matcher_key: cfg.extract.key.clone(),
+                matcher_mode: match cfg.extract.mode {
+                    ExtractMode::Plain => "plain".into(),
+                    ExtractMode::Url => "url".into(),
+                },
+                size_bytes: info.size,
+                lines_scanned: stats.lines_scanned,
+                lines_matched: stats.lines_matched,
+            };
+
+            let job = crate::pipeline::upload::UploadJob {
+                // sha256 stays empty until Phase 7 wires content hashing
+                // through `cmd::fetch`. Downstream observers must tolerate.
+                sha256: String::new(),
+                output_path: out_path.clone(),
+                caption: caption_data,
+            };
+            // `cmd::fetch` is a one-shot: a single source message produces a
+            // single UploadJob, so a 1-element channel is correct here.
+            // Phase 8 (`cmd::watch`) and Phase 9 (`cmd::backfill`) will instead
+            // size these channels from `cfg.pipeline.upload_channel_capacity`
+            // (and `inter_file_channel_capacity` for the per-file fan-in).
+            let (jt, jr) = tokio::sync::mpsc::channel(1);
+            let (ot, mut or) = tokio::sync::mpsc::channel(1);
+            let upload_cfg = crate::pipeline::upload::UploadRunConfig {
+                target_chat_id,
+                upload_max_size_bytes: cfg.pipeline.upload_max_size_bytes,
+                upload_rate_seconds: cfg.pipeline.upload_rate_seconds,
+                retry: crate::pipeline::upload::RetryPolicy::default(),
+            };
+            jt.send(job).await.context("send upload job")?;
+            drop(jt);
+            crate::pipeline::upload::run(client, jr, ot, &upload_cfg, |_j, e| {
+                tracing::error!(
+                    error = %format!("{e:#}"),
+                    "fetch: upload failed (Phase 7 will persist this to failed_uploads)",
+                );
+            })
+            .await
+            .context("upload run")?;
+            while let Some(o) = or.recv().await {
+                if let crate::pipeline::upload::UploadOutcome::Done {
+                    output_msg_ids, ..
+                } = o
+                {
+                    tracing::info!(?output_msg_ids, "fetch upload complete");
+                }
+            }
+        }
     }
+
+    Ok(())
 }
 
 /// Stream-extract path: in-memory pipeline through `stream_extract`.
@@ -146,7 +231,7 @@ async fn run_stream_path(
     rx: tokio::sync::mpsc::Receiver<Bytes>,
     matcher: Arc<Matcher>,
     is_gzip: bool,
-) -> Result<()> {
+) -> Result<CaptionStats> {
     let writer = std::fs::File::create(out_path)
         .with_context(|| format!("create {}", out_path.display()))?;
     let (_file, stats) = stream_extract(rx, matcher, cfg.pipeline.max_line_bytes, writer, is_gzip)
@@ -164,7 +249,10 @@ async fn run_stream_path(
         bytes_scanned = stats.bytes_scanned,
         "fetch complete (stream)",
     );
-    Ok(())
+    Ok(CaptionStats {
+        lines_scanned: stats.lines_scanned,
+        lines_matched: stats.lines_matched,
+    })
 }
 
 /// Disk-spill path: spool the archive to a tempfile, then iterate its entries
@@ -175,7 +263,7 @@ async fn run_disk_path(
     out_path: &Path,
     rx: tokio::sync::mpsc::Receiver<Bytes>,
     matcher: Arc<Matcher>,
-) -> Result<()> {
+) -> Result<CaptionStats> {
     let stats = disk_extract(
         rx,
         matcher,
@@ -198,7 +286,10 @@ async fn run_disk_path(
         entries_skipped = stats.entries_skipped,
         "fetch complete (disk-spill)",
     );
-    Ok(())
+    Ok(CaptionStats {
+        lines_scanned: stats.lines_scanned,
+        lines_matched: stats.lines_matched,
+    })
 }
 
 /// Resolve CLI arguments to a `(chat_id, msg_id)` pair.
@@ -228,6 +319,51 @@ async fn resolve_target<C: TelegramClient>(args: &FetchArgs, client: &C) -> Resu
             Ok((chat_id, msg_id))
         }
     }
+}
+
+/// Resolve the configured output chat for the upload step, applying the
+/// spec §11.2 public-chat safety gate.
+///
+/// Returns `Ok(None)` (skip upload) when neither `chat` nor `chat_id` is set,
+/// or when `chat` is set to an empty/whitespace-only string.
+///
+/// Public-chat heuristic: a `chat` string is treated as public iff it starts
+/// with `@` OR fails to parse as an `i64`. Numeric strings (e.g.
+/// `"-1001234567890"`) are private references and are accepted without
+/// `--confirm-public`. Anything else (`"@chan"`, `"my_channel"`, channel
+/// titles, typos) is public and requires `args.confirm_public`.
+async fn resolve_output_chat<C: TelegramClient>(
+    cfg: &AppConfig,
+    args: &FetchArgs,
+    client: &C,
+) -> Result<Option<i64>> {
+    if let Some(id) = cfg.telegram.output.chat_id {
+        return Ok(Some(id));
+    }
+    let Some(name) = cfg.telegram.output.chat.as_deref() else {
+        return Ok(None);
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let looks_public = trimmed.starts_with('@') || trimmed.parse::<i64>().is_err();
+    if looks_public && !args.confirm_public {
+        bail!(
+            "telegram.output.chat = {trimmed:?} looks public; pass --confirm-public to upload there \
+             (spec §11.2: public outputs require explicit acknowledgement)",
+        );
+    }
+    if let Ok(id) = trimmed.parse::<i64>() {
+        return Ok(Some(id));
+    }
+    let resolved = client
+        .resolve_chat(&ChatRef::Username(
+            trimmed.trim_start_matches('@').to_string(),
+        ))
+        .await
+        .context("resolve telegram.output.chat")?;
+    Ok(Some(resolved))
 }
 
 /// Strip a single well-known extension suffix from a sanitized filename stem.
