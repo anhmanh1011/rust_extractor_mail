@@ -23,11 +23,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use bytes::Bytes;
+use tempfile::NamedTempFile;
 use tokio::sync::mpsc;
 
 // `Store`, `MessageInfo`, and `TelegramClient` appear only as parameter or
 // field types in the skeleton. They become live in Task 10.2 (download stage).
+use crate::pipeline::format::{detect as detect_format, Format};
 use crate::store::Store;
 use crate::telegram::{MessageInfo, TelegramClient};
 
@@ -160,4 +163,151 @@ pub async fn run<C: TelegramClient + ?Sized>(
         // swallow
     }
     Ok(())
+}
+
+/// Stage 1 → Stage 2 hand-off shape. The variant determines which intra-file
+/// path Stage 2 takes (stream vs disk-spill, per spec §4.1).
+#[derive(Debug)]
+pub enum Stage1Out {
+    /// `.txt` / `.gz` flow. `chunks_rx` is the live download stream; Stage 2
+    /// consumes it directly. `first_chunk` is the prefix already read for
+    /// format detection — Stage 2 must process it BEFORE pulling more from
+    /// `chunks_rx`. `is_gzip` is true iff `format == Gz`.
+    Stream {
+        /// The job whose download produced this stream.
+        job:           Job,
+        /// Detected format (always `Txt` or `Gz` in this variant).
+        format:        Format,
+        /// `true` iff `format == Format::Gz`; cached so Stage 2 doesn't
+        /// re-match the enum.
+        is_gzip:       bool,
+        /// Prefix already pulled off the download stream for format
+        /// detection. Stage 2 must drain this before reading more from
+        /// `chunks_rx`.
+        first_chunk:   Bytes,
+        /// Live download stream of remaining chunks. Each item is
+        /// `Result<Bytes>` so Stage 2 can surface mid-download network
+        /// failures as per-job `OutcomeKind::Failed`.
+        chunks_rx:     mpsc::Receiver<Result<Bytes>>,
+    },
+    /// `.zip` flow. The temp file is fully written and ready to mmap.
+    /// Drop semantics: when Stage 2 finishes, dropping `temp` deletes the
+    /// underlying file; if Stage 2 is cancelled before reading, drop still
+    /// fires here on send-side hangup.
+    Disk {
+        /// The job whose download produced this tempfile.
+        job:    Job,
+        /// Detected format (always `Zip` in this variant).
+        format: Format,
+        /// Owned tempfile holding the full downloaded payload. Deletes on
+        /// drop; Stage 2 mmaps `temp.path()` then drops `temp` when done.
+        temp:   NamedTempFile,
+    },
+    /// Stage 1 itself failed (e.g., download error, unknown format). The
+    /// orchestrator forwards this to Stage 3 unchanged so the cursor
+    /// callback fires in FIFO order even for early failures.
+    Failed {
+        /// The job that failed in Stage 1.
+        job:   Job,
+        /// Anyhow error chain describing the Stage-1 failure.
+        error: anyhow::Error,
+    },
+}
+
+/// Stage 1 task body. Pulls jobs from `jobs_rx`, opens the download stream
+/// for each, peeks the first chunk for format detection, and forwards a
+/// `Stage1Out` to `s1_tx`. Returns `Ok(())` when `jobs_rx` is closed and
+/// the last forward completes; returns `Err(_)` only on infrastructure
+/// failures (channel send to a hung-up receiver during stage shutdown is
+/// treated as cooperative cancellation and returns Ok).
+pub async fn download_stage<C: TelegramClient + ?Sized>(
+    client:      &C,
+    _cfg:        &PipelineConfig,
+    mut jobs_rx: mpsc::Receiver<Job>,
+    s1_tx:       mpsc::Sender<Stage1Out>,
+) -> Result<()> {
+    while let Some(job) = jobs_rx.recv().await {
+        let chat = job.source_chat_id;
+        let msg  = job.source_msg_id;
+
+        // Open stream + peek first chunk for format detection.
+        let mut chunks_in = match client.download_stream(chat, msg).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                if s1_tx.send(Stage1Out::Failed { job, error: e.context("download_stream") })
+                    .await.is_err()
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        let first = match chunks_in.recv().await {
+            Some(Ok(b)) => b,
+            Some(Err(e)) => {
+                if s1_tx.send(Stage1Out::Failed { job, error: e.context("first chunk") })
+                    .await.is_err()
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+            None => Bytes::new(),
+        };
+        let format = detect_format(&job.info.original_name, &first);
+
+        let send_res = match format {
+            Format::Txt | Format::Gz => {
+                let is_gzip = matches!(format, Format::Gz);
+                s1_tx.send(Stage1Out::Stream {
+                    job, format, is_gzip,
+                    first_chunk: first,
+                    chunks_rx:   chunks_in,
+                }).await
+            }
+            Format::Zip => {
+                match drain_to_tempfile(first, chunks_in).await {
+                    Ok(temp) => s1_tx.send(Stage1Out::Disk { job, format, temp }).await,
+                    Err(e)   => s1_tx.send(Stage1Out::Failed {
+                        job, error: e.context("download zip → tempfile"),
+                    }).await,
+                }
+            }
+            Format::Unknown => {
+                s1_tx.send(Stage1Out::Failed {
+                    job,
+                    error: anyhow::anyhow!("unknown format (extension + magic both inconclusive)"),
+                }).await
+            }
+        };
+        if send_res.is_err() {
+            // Stage 2 hung up (cancellation). Cooperate by exiting cleanly.
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+async fn drain_to_tempfile(
+    first:        Bytes,
+    mut chunks:   mpsc::Receiver<Result<Bytes>>,
+) -> Result<NamedTempFile> {
+    use tokio::io::AsyncWriteExt;
+    let temp     = tempfile::NamedTempFile::new().context("NamedTempFile::new")?;
+    let path     = temp.path().to_path_buf();
+    let std_file = temp.reopen().context("reopen temp")?;
+    let mut f    = tokio::fs::File::from_std(std_file);
+
+    if !first.is_empty() {
+        f.write_all(&first).await
+            .with_context(|| format!("write first chunk to {}", path.display()))?;
+    }
+    while let Some(item) = chunks.recv().await {
+        let b = item.context("zip download chunk")?;
+        f.write_all(&b).await
+            .with_context(|| format!("write chunk to {}", path.display()))?;
+    }
+    f.flush().await.context("flush tempfile")?;
+    drop(f);    // close handle so Stage 2 can mmap the path
+    Ok(temp)
 }
