@@ -36,8 +36,10 @@ use extractor_core::ScanStats;
 use crate::output::{join_safe, sanitize};
 use crate::pipeline::format::{detect as detect_format, Format};
 use crate::pipeline::stream::stream_extract;
+use crate::pipeline::upload::{self, UploadJob, UploadOutcome, UploadRunConfig};
 use crate::store::{EnqueueResult, FileMeta, Store};
 use crate::telegram::{MessageInfo, TelegramClient};
+use crate::upload::caption::CaptionData;
 
 /// One unit of inter-file work supplied by the upstream subcommand
 /// (`fetch` / `watch` / `backfill`).
@@ -152,21 +154,32 @@ pub struct PipelineConfig {
 /// no `files` rows are written. Production callers always pass `Some`;
 /// tests use `None` to exercise the pipe in isolation.
 ///
-/// **Task 10.1 skeleton:** the body drains `jobs_rx` without doing any
-/// work, so an empty stream is a no-op `Ok(())`. Stage 1 / 2 / 3 spawn
-/// graphs land in Tasks 10.2-10.4.
+/// Task 10.4: drives the three stages concurrently via `tokio::join!` over
+/// async blocks (not `tokio::spawn`) — `&client` and `Option<&Store>` are
+/// borrowed across all three stages and `spawn` would force `'static`,
+/// requiring `Arc` cloning that the borrow already prevents.
 pub async fn run<C: TelegramClient + ?Sized>(
-    _client: &C,
-    _store: Option<&Store>,
-    _cfg: &PipelineConfig,
-    mut jobs_rx: mpsc::Receiver<Job>,
-    _on_outcome: CursorAdvance,
+    client:     &C,
+    store:      Option<&Store>,
+    cfg:        &PipelineConfig,
+    jobs_rx:    mpsc::Receiver<Job>,
+    on_outcome: CursorAdvance,
 ) -> Result<()> {
-    // Skeleton: drain the input channel so the empty-stream test passes.
-    // Replaced in Tasks 10.2 / 10.3 / 10.4 with the three-stage spawn graph.
-    while jobs_rx.recv().await.is_some() {
-        // swallow
-    }
+    let (s1_tx, s1_rx) = mpsc::channel::<Stage1Out>(cfg.inter_file_channel_capacity);
+    let (s2_tx, s2_rx) = mpsc::channel::<Stage2Out>(cfg.upload_channel_capacity);
+
+    // Stage 1: download. The `s1_tx` half is moved into the s1_handle
+    // async block so the only live sender lives on Stage 1's task — when
+    // download_stage returns, the sender is dropped and Stage 2's recv()
+    // observes a clean channel close.
+    let s1_handle = async move { download_stage(client, cfg, jobs_rx, s1_tx).await };
+    let s2_handle = async move { extract_stage(store, cfg, s1_rx, s2_tx).await };
+    let s3_handle = async move { upload_stage(client, cfg, s2_rx, on_outcome).await };
+
+    let (r1, r2, r3) = tokio::join!(s1_handle, s2_handle, s3_handle);
+    r1?;
+    r2?;
+    r3?;
     Ok(())
 }
 
@@ -568,4 +581,104 @@ fn format_label(f: &Format) -> &'static str {
         Format::Zip => "zip",
         Format::Unknown => "unknown",
     }
+}
+
+/// Stage 3 task body. Drains `Stage2Out` items off `s2_rx` and either
+/// (a) forwards `Failed` / `Deduped` directly to `on_outcome`, or
+/// (b) for `Ready`, dispatches a single-job `pipeline::upload::run` and
+/// folds its `UploadOutcome` into `JobOutcome` before invoking
+/// `on_outcome`. Outcomes fire in strict FIFO input order — Stage 3
+/// processes one `Stage2Out` at a time, awaiting `upload::run` to
+/// completion before pulling the next item, so `cmd::watch` and
+/// `cmd::backfill` cursor monotonicity holds.
+pub async fn upload_stage<C: TelegramClient + ?Sized>(
+    client:     &C,
+    cfg:        &PipelineConfig,
+    mut s2_rx:  mpsc::Receiver<Stage2Out>,
+    on_outcome: CursorAdvance,
+) -> Result<()> {
+    let upload_cfg = UploadRunConfig {
+        target_chat_id:        cfg.target_chat_id,
+        upload_max_size_bytes: cfg.upload_max_size_bytes,
+        upload_rate_seconds:   cfg.upload_rate_seconds,
+        retry:                 upload::RetryPolicy::default(),
+    };
+
+    while let Some(s2) = s2_rx.recv().await {
+        match s2 {
+            Stage2Out::Failed { job, error } => {
+                on_outcome(JobOutcome {
+                    job,
+                    kind: OutcomeKind::Failed { error: format!("{error:#}") },
+                });
+            }
+            Stage2Out::Deduped { job, sha256 } => {
+                on_outcome(JobOutcome {
+                    job,
+                    kind: OutcomeKind::Deduped { sha256 },
+                });
+            }
+            Stage2Out::Ready {
+                job, sha256, output_path,
+                lines_scanned, lines_matched, format: _format,
+            } => {
+                let (in_tx, in_rx)       = mpsc::channel::<UploadJob>(1);
+                let (out_tx, mut out_rx) = mpsc::channel::<UploadOutcome>(1);
+                let caption = CaptionData {
+                    original_name:  job.info.original_name.clone(),
+                    source_chat_id: job.source_chat_id,
+                    source_msg_id:  job.source_msg_id,
+                    matcher_key:    cfg.matcher_key.clone(),
+                    matcher_mode:   cfg.matcher_mode.clone(),
+                    size_bytes:     job.info.size_bytes,
+                    lines_scanned,
+                    lines_matched,
+                };
+                if in_tx
+                    .send(UploadJob {
+                        sha256:      sha256.clone(),
+                        output_path: output_path.clone(),
+                        caption,
+                    })
+                    .await
+                    .is_err()
+                {
+                    on_outcome(JobOutcome {
+                        job,
+                        kind: OutcomeKind::Failed {
+                            error: "upload channel closed before send".into(),
+                        },
+                    });
+                    continue;
+                }
+                drop(in_tx);
+
+                let on_failed = |_j: UploadJob, _e: anyhow::Error| {};
+                let upload_run = upload::run(client, in_rx, out_tx, &upload_cfg, on_failed);
+                let drainer    = async { out_rx.recv().await };
+                let (upload_res, outcome_opt) = tokio::join!(upload_run, drainer);
+                if let Err(e) = upload_res {
+                    on_outcome(JobOutcome {
+                        job,
+                        kind: OutcomeKind::Failed { error: format!("{e:#}") },
+                    });
+                    continue;
+                }
+                let kind = match outcome_opt {
+                    Some(UploadOutcome::Done { sha256, output_msg_ids }) =>
+                        OutcomeKind::Uploaded { sha256, output_msg_ids },
+                    Some(UploadOutcome::Skipped { sha256, reason }) =>
+                        OutcomeKind::Failed {
+                            error: format!("upload skipped ({reason}) for {sha256}"),
+                        },
+                    None =>
+                        OutcomeKind::Failed {
+                            error: "upload produced no outcome (permanent failure)".into(),
+                        },
+                };
+                on_outcome(JobOutcome { job, kind });
+            }
+        }
+    }
+    Ok(())
 }
