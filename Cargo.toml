@@ -3,6 +3,7 @@ resolver = "2"
 members  = [
     "crates/extractor-core",
     "crates/extract-mail",
+    "crates/telegram-client",
 ]
 
 [workspace.package]
@@ -47,9 +48,13 @@ rusqlite            = { version = "0.31", features = ["bundled"] }
 tempfile            = "3"
 
 # Telegram
-grammers-client     = "0.6"
-grammers-session    = "0.6"
-grammers-tl-types   = "0.6"
+# Note: pinned to 0.7 (caret) — 0.6 series was never published to crates.io.
+# The plan/spec (Phase 0) referenced 0.6 in error; bumped during Phase 2 Task 2.1.
+grammers-client     = "0.7"
+grammers-session    = "0.7"
+grammers-tl-types   = "0.7"
+async-trait         = "0.1"
+rpassword           = "7"
 
 # Dev / test
 proptest            = "1"

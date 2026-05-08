@@ -1,0 +1,61 @@
+[package]
+name         = "telegram-client"
+version      = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+description  = "Streaming Telegram large-file extraction pipeline."
+
+[[bin]]
+name = "tg-extract"
+path = "src/main.rs"
+
+[dependencies]
+extractor-core      = { path = "../extractor-core" }
+
+# CLI + error
+anyhow              = { workspace = true }
+thiserror           = { workspace = true }
+clap                = { workspace = true }
+
+# Async + streaming
+tokio               = { workspace = true }
+futures             = { workspace = true }
+bytes               = { workspace = true }
+async-trait         = { workspace = true }
+
+# Telegram
+grammers-client     = { workspace = true }
+grammers-session    = { workspace = true }
+grammers-tl-types   = { workspace = true }
+rpassword           = { workspace = true }
+
+# Format handling
+flate2              = { workspace = true }
+zip                 = { workspace = true }
+sha2                = { workspace = true }
+memchr              = { workspace = true }
+memmap2             = { workspace = true }
+
+# Storage
+rusqlite            = { workspace = true }
+
+# Config + serde
+serde               = { workspace = true }
+toml                = { workspace = true }
+dirs                = { workspace = true }
+
+# Observability
+tracing             = { workspace = true }
+tracing-subscriber  = { workspace = true }
+tracing-appender    = { workspace = true }
+indicatif           = { workspace = true }
+
+# Filesystem helpers
+tempfile            = { workspace = true }
+
+[dev-dependencies]
+tempfile            = { workspace = true }
+# Phase 3+ tests rely on tokio's `test-util` (additive on top of the
+# runtime feature set declared at the workspace root):
+tokio               = { workspace = true, features = ["test-util"] }
