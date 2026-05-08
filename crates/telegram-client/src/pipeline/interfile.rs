@@ -20,18 +20,23 @@
 //! Task 10.1 lands the public surface only; `run` is a no-op drain.
 //! Tasks 10.2 / 10.3 / 10.4 wire Stage 1 / Stage 2 / Stage 3 in turn.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc;
 
+use extractor_core::ScanStats;
+
 // `Store`, `MessageInfo`, and `TelegramClient` appear only as parameter or
 // field types in the skeleton. They become live in Task 10.2 (download stage).
+use crate::output::{join_safe, sanitize};
 use crate::pipeline::format::{detect as detect_format, Format};
-use crate::store::Store;
+use crate::pipeline::stream::stream_extract;
+use crate::store::{EnqueueResult, FileMeta, Store};
 use crate::telegram::{MessageInfo, TelegramClient};
 
 /// One unit of inter-file work supplied by the upstream subcommand
@@ -310,4 +315,257 @@ async fn drain_to_tempfile(
     f.flush().await.context("flush tempfile")?;
     drop(f);    // close handle so Stage 2 can mmap the path
     Ok(temp)
+}
+
+/// Stage 2 → Stage 3 hand-off shape.
+#[derive(Debug)]
+pub enum Stage2Out {
+    /// Bytes hashed, scanned, written. Ready for upload.
+    Ready {
+        /// The job whose payload was extracted.
+        job:            Job,
+        /// SHA-256 of the original downloaded document, lowercase hex.
+        sha256:         String,
+        /// On-disk path to the materialized `.out` file ready for upload.
+        output_path:    PathBuf,
+        /// Total lines scanned by `extractor-core`.
+        lines_scanned:  u64,
+        /// Lines that matched the configured matcher.
+        lines_matched:  u64,
+        /// Detected format of the source document.
+        format:         Format,
+    },
+    /// Hash showed dedup hit before extraction completed (or after, if the
+    /// store was consulted post-hash). No output exists; Stage 3 forwards
+    /// to `OutcomeKind::Deduped` directly without touching uploads.
+    Deduped {
+        /// The job that was deduped.
+        job:    Job,
+        /// SHA-256 that matched an existing `done` row in `files`.
+        sha256: String,
+    },
+    /// Stage-2 failure. Forwarded to Stage 3 untouched.
+    Failed {
+        /// The job that failed in Stage 2.
+        job:   Job,
+        /// Anyhow error chain describing the Stage-2 failure.
+        error: anyhow::Error,
+    },
+}
+
+/// Stage 2 task body. Pulls `Stage1Out` items off `s1_rx`, performs the
+/// per-format intra-file extract+write, and forwards a `Stage2Out` to
+/// `s2_tx`. The function returns `Ok(())` when `s1_rx` is closed and the
+/// last forward completes; a hung-up `s2_tx` is treated as cooperative
+/// cancellation (returns `Ok(())`).
+pub async fn extract_stage(
+    store:        Option<&Store>,
+    cfg:          &PipelineConfig,
+    mut s1_rx:    mpsc::Receiver<Stage1Out>,
+    s2_tx:        mpsc::Sender<Stage2Out>,
+) -> Result<()> {
+    while let Some(s1) = s1_rx.recv().await {
+        let out = match s1 {
+            Stage1Out::Stream { job, format, is_gzip, first_chunk, chunks_rx } =>
+                handle_stream(store, cfg, job, format, is_gzip, first_chunk, chunks_rx).await,
+            Stage1Out::Disk { job, format, temp } =>
+                handle_disk(store, cfg, job, format, temp).await,
+            Stage1Out::Failed { job, error } =>
+                Stage2Out::Failed { job, error },
+        };
+        if s2_tx.send(out).await.is_err() {
+            // Stage 3 hung up (cancellation). Cooperate.
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+async fn handle_stream(
+    store:       Option<&Store>,
+    cfg:         &PipelineConfig,
+    job:         Job,
+    format:      Format,
+    is_gzip:     bool,
+    first_chunk: Bytes,
+    mut chunks:  mpsc::Receiver<anyhow::Result<Bytes>>,
+) -> Stage2Out {
+    let (out_path, chat_dir) = match build_output_path(cfg, &job) {
+        Ok(p)  => p,
+        Err(e) => return Stage2Out::Failed { job, error: e },
+    };
+    if let Err(e) = std::fs::create_dir_all(&chat_dir) {
+        return Stage2Out::Failed {
+            job,
+            error: anyhow::Error::new(e).context(format!("mkdir {}", chat_dir.display())),
+        };
+    }
+
+    // Tee: feed (a) stream_extract pipeline, (b) sha256 hasher.
+    let (pipe_tx, pipe_rx) = mpsc::channel::<Bytes>(cfg.intra_file_channel_capacity);
+    let (hash_tx, mut hash_rx) = mpsc::channel::<Bytes>(cfg.intra_file_channel_capacity);
+
+    let hasher = tokio::spawn(async move {
+        let mut h = Sha256::new();
+        while let Some(b) = hash_rx.recv().await { h.update(&b); }
+        hex::encode(h.finalize())
+    });
+
+    let first = first_chunk.clone();
+    let pipe_tx_first = pipe_tx.clone();
+    let hash_tx_first = hash_tx.clone();
+    let teer = tokio::spawn(async move {
+        if !first.is_empty() {
+            let _ = pipe_tx_first.send(first.clone()).await;
+            let _ = hash_tx_first.send(first).await;
+        }
+        while let Some(item) = chunks.recv().await {
+            match item {
+                Ok(b) => {
+                    if pipe_tx.send(b.clone()).await.is_err() { return; }
+                    if hash_tx.send(b).await.is_err()         { return; }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    let matcher = match make_matcher(cfg) {
+        Ok(m)  => m,
+        Err(e) => return Stage2Out::Failed { job, error: e },
+    };
+    let writer = match std::fs::File::create(&out_path) {
+        Ok(f)  => f,
+        Err(e) => return Stage2Out::Failed {
+            job, error: anyhow::Error::new(e).context(format!("create {}", out_path.display())),
+        },
+    };
+    let extract_res = stream_extract(pipe_rx, matcher, cfg.max_line_bytes, writer, is_gzip).await;
+    let _ = teer.await;
+    let stats = match extract_res {
+        Ok((_file, s)) => s,
+        Err(e) => return Stage2Out::Failed {
+            job, error: e.context(format!("stream_extract {}", out_path.display())),
+        },
+    };
+    let sha = match hasher.await {
+        Ok(s) => s,
+        Err(e) => return Stage2Out::Failed { job, error: anyhow::Error::new(e).context("hasher join") },
+    };
+
+    // Optional store dedup + transitions.
+    if let Some(s) = store {
+        match enqueue_and_advance(s, cfg, &job, &sha, &stats, &out_path, &format) {
+            Ok(true)  => return Stage2Out::Deduped { job, sha256: sha },
+            Ok(false) => {}
+            Err(e)    => return Stage2Out::Failed { job, error: e },
+        }
+    }
+
+    Stage2Out::Ready {
+        job, sha256: sha, output_path: out_path,
+        lines_scanned: stats.lines_scanned,
+        lines_matched: stats.lines_matched,
+        format,
+    }
+}
+
+async fn handle_disk(
+    _store:  Option<&Store>,
+    _cfg:    &PipelineConfig,
+    job:     Job,
+    _format: Format,
+    _temp:   tempfile::NamedTempFile,
+) -> Stage2Out {
+    // 10a scope: zip path delegates to crate::pipeline::disk::extract_zip.
+    // This adapter is intentionally minimal — the disk-spill happy path is
+    // exercised end-to-end in Task 10.5's pipeline test (which uses a txt
+    // payload to keep the assertion graph simple). A dedicated zip E2E test
+    // lands in Chunk 6b's red-team suite (zip-bomb integration test
+    // already-existing path coverage).
+    Stage2Out::Failed {
+        job,
+        error: anyhow::anyhow!(
+            "disk-spill (zip) Stage 2 adapter is a Chunk-6b deliverable — \
+             10a covers stream path only"
+        ),
+    }
+}
+
+fn build_output_path(cfg: &PipelineConfig, job: &Job) -> anyhow::Result<(PathBuf, PathBuf)> {
+    let chat_dir = cfg.output_dir.join(job.source_chat_id.to_string());
+    let stem     = sanitize(&job.info.original_name);
+    let stem     = strip_known_ext(&stem);
+    let out_name = format!("{}_{}.out", job.source_msg_id, stem);
+    let out_path = join_safe(&chat_dir, &out_name)
+        .with_context(|| format!("join_safe under {}", chat_dir.display()))?;
+    Ok((out_path, chat_dir))
+}
+
+fn strip_known_ext(name: &str) -> String {
+    for ext in [".txt", ".gz", ".zip"] {
+        if let Some(stripped) = name.strip_suffix(ext) { return stripped.into(); }
+    }
+    name.into()
+}
+
+fn make_matcher(cfg: &PipelineConfig) -> anyhow::Result<std::sync::Arc<extractor_core::Matcher>> {
+    let mode = match cfg.matcher_mode.as_str() {
+        "plain" => extractor_core::Mode::Plain,
+        "url"   => extractor_core::Mode::Url,
+        other   => anyhow::bail!("invalid matcher_mode {other:?}; expected 'plain' or 'url'"),
+    };
+    Ok(std::sync::Arc::new(
+        extractor_core::Matcher::new(&cfg.matcher_key, mode)
+            .context("Matcher::new")?,
+    ))
+}
+
+/// Returns `Ok(true)` iff the row was already done (dedup short-circuit;
+/// caller emits `Stage2Out::Deduped`). Returns `Ok(false)` to mean
+/// "proceed to upload".
+fn enqueue_and_advance(
+    s:        &Store,
+    cfg:      &PipelineConfig,
+    job:      &Job,
+    sha:      &str,
+    stats:    &ScanStats,
+    out_path: &Path,
+    format:   &Format,
+) -> anyhow::Result<bool> {
+    let meta = FileMeta {
+        sha256:         sha.to_string(),
+        source_chat_id: job.source_chat_id,
+        source_msg_id:  job.source_msg_id,
+        original_name:  job.info.original_name.clone(),
+        size_bytes:     job.info.size_bytes,
+        format:         format_label(format).into(),
+        matcher_key:    cfg.matcher_key.clone(),
+        matcher_mode:   cfg.matcher_mode.clone(),
+    };
+    match s.try_enqueue(&meta).context("try_enqueue")? {
+        EnqueueResult::AlreadyDone => {
+            tracing::info!(sha256 = %sha, "interfile: dedup hit (file already done)");
+            let _ = std::fs::remove_file(out_path);
+            return Ok(true);
+        }
+        EnqueueResult::InProgress(state) => {
+            tracing::warn!(sha256 = %sha, state = %state,
+                "interfile: another run is processing this file; proceeding (last-writer wins)");
+        }
+        EnqueueResult::New => {}
+    }
+    s.mark_downloading(sha)?;
+    s.mark_downloaded(sha)?;
+    s.mark_extracted(sha, stats.lines_scanned, stats.lines_matched, out_path)?;
+    Ok(false)
+}
+
+fn format_label(f: &Format) -> &'static str {
+    match f {
+        Format::Txt => "txt",
+        Format::Gz  => "gz",
+        Format::Zip => "zip",
+        Format::Unknown => "unknown",
+    }
 }
