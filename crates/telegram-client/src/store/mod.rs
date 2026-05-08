@@ -28,6 +28,13 @@ impl Store {
             .with_context(|| format!("open sqlite at {}", db_path.display()))?;
         // PRAGMAs first (WAL persists in DB header; safe to issue every open).
         conn.pragma_update(None, "journal_mode", "WAL").context("set WAL")?;
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .context("query journal_mode after pragma_update")?;
+        anyhow::ensure!(
+            mode.eq_ignore_ascii_case("wal"),
+            "failed to enable WAL journal mode (got '{mode}'); networked FS or locked DB?"
+        );
         conn.pragma_update(None, "synchronous", "NORMAL").context("set synchronous")?;
         conn.pragma_update(None, "foreign_keys", true).context("set foreign_keys")?;
         // Migrations.

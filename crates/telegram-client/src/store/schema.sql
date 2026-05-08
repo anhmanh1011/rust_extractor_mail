@@ -1,3 +1,4 @@
+BEGIN;
 CREATE TABLE IF NOT EXISTS files (
     sha256             TEXT PRIMARY KEY,
     source_chat_id     INTEGER NOT NULL,
@@ -48,3 +49,4 @@ CREATE TABLE IF NOT EXISTS failed_uploads (
 
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
 INSERT OR IGNORE INTO schema_version VALUES (1);
+COMMIT;

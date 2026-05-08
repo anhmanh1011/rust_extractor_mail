@@ -22,7 +22,8 @@ fn open_creates_tables_and_sets_wal() {
             "SELECT count(*) FROM sqlite_master \
              WHERE type='table' AND name IN \
              ('files','watch_state','backfill_state','failed_uploads','schema_version')",
-            [], |r| r.get(0),
+            [],
+            |r| r.get(0),
         )
         .unwrap();
     assert_eq!(count, 5);
@@ -33,6 +34,6 @@ fn open_is_idempotent() {
     let tmp = tempfile::tempdir().unwrap();
     let dbp = tmp.path().join("state.db");
     let _ = Store::open(&dbp).unwrap();
-    let _ = Store::open(&dbp).unwrap();          // no-op migrations
+    let _ = Store::open(&dbp).unwrap(); // no-op migrations
     let _ = Store::open(&dbp).unwrap();
 }
