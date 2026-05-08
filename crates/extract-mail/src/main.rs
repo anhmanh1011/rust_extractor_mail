@@ -63,7 +63,7 @@ fn main() -> Result<()> {
             let mut scanner = Scanner::new(&matcher);
             scanner
                 .scan_all(&mmap[start..end], &mut out)
-                .map_err(|e| anyhow::anyhow!("scan: {e}"))?;
+                .map_err(|e| anyhow::Error::new(e).context("scan chunk"))?;
             Ok(out)
         })
         .collect::<Result<_>>()?;
