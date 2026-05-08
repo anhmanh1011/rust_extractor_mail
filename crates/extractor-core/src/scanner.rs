@@ -68,6 +68,8 @@ impl<'m> Scanner<'m> {
         }
     }
 
+    /// Feed a chunk. Lines split across chunks are stitched via internal
+    /// carry buffer.
     pub fn feed<S: LineSink>(
         &mut self,
         chunk: &[u8],
