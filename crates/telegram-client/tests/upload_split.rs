@@ -47,3 +47,40 @@ async fn pathological_long_line_returns_err() {
     assert!(msg.contains("line longer than cap"),
         "expected 'line longer than cap' classification: {msg}");
 }
+
+#[tokio::test]
+async fn splits_no_trailing_newline_input() {
+    // Input without a trailing '\n'; cap forces 2 parts. Verify no data loss
+    // and that the final part is written as-is (no synthesized newline).
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("notrail.out");
+    let original: &[u8] = b"aaa\nbbb\nccc";
+    std::fs::write(&p, original).unwrap();
+
+    let parts = split_for_upload(&p, 8).await.unwrap();
+    assert_eq!(parts.len(), 2, "expected 2 parts; got {parts:?}");
+
+    let mut total = Vec::new();
+    for part in &parts {
+        let bytes = std::fs::read(part).unwrap();
+        assert!(bytes.len() <= 8, "part {} = {} B exceeds cap", part.display(), bytes.len());
+        total.extend_from_slice(&bytes);
+    }
+    assert_eq!(total, original, "concatenation of parts must equal original");
+
+    let last = std::fs::read(parts.last().unwrap()).unwrap();
+    assert!(!last.ends_with(b"\n"),
+        "last part should preserve the original (no trailing newline): {last:?}");
+}
+
+#[tokio::test]
+async fn cap_zero_returns_err() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("any.out");
+    std::fs::write(&p, b"alice@x.com:p1\n").unwrap();
+
+    let err = split_for_upload(&p, 0).await.unwrap_err();
+    let msg = format!("{err:#}");
+    assert!(msg.contains("cap_bytes must be > 0"),
+        "expected 'cap_bytes must be > 0' classification: {msg}");
+}

@@ -2,10 +2,10 @@
 //! (chat, path, caption) to completion or to budget-exhaustion.
 //! `run` (Task 6.5) orchestrates a stream of `UploadJob`s.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 
 use crate::telegram::TelegramClient;
 
@@ -106,12 +106,12 @@ fn jittered(base: Duration, ratio: f64) -> Duration {
 
 // ── Task 6.4: split_for_upload ────────────────────────────────────────────────
 
-use anyhow::Context as _;
-use std::path::PathBuf;
-
 /// Slice a file into part files, each `<= cap_bytes`, breaking on the last
 /// `\n` before the cap. Returns the list of part paths in order. If the
 /// file is already `<= cap_bytes`, returns `vec![original_path]` (no copy).
+///
+/// Input may end without a trailing `\n`; the final line is written as-is
+/// to the last part provided it does not by itself exceed `cap_bytes`.
 ///
 /// Side effects: creates `<orig>.part01`, `<orig>.part02`, … next to `path`.
 /// On error, partially-written part files are left in place — callers
@@ -120,11 +120,15 @@ use std::path::PathBuf;
 ///
 /// # Errors
 ///
+/// - `"cap_bytes must be > 0"` when `cap_bytes == 0`.
 /// - `"line longer than cap"` when a single line exceeds `cap_bytes` (cannot
 ///   split on a line boundary).
 /// - I/O errors propagated with `anyhow::Context` from `metadata`/`open`/
 ///   `create`/`fill_buf`/`write_all`/`flush`.
 pub async fn split_for_upload(path: &Path, cap_bytes: u64) -> Result<Vec<PathBuf>> {
+    if cap_bytes == 0 {
+        anyhow::bail!("split_for_upload: cap_bytes must be > 0");
+    }
     let total = tokio::fs::metadata(path)
         .await
         .with_context(|| format!("metadata {}", path.display()))?
@@ -133,8 +137,7 @@ pub async fn split_for_upload(path: &Path, cap_bytes: u64) -> Result<Vec<PathBuf
         return Ok(vec![path.to_path_buf()]);
     }
     let path_buf = path.to_path_buf();
-    let cap = cap_bytes;
-    tokio::task::spawn_blocking(move || split_blocking(&path_buf, cap))
+    tokio::task::spawn_blocking(move || split_blocking(&path_buf, cap_bytes))
         .await
         .context("split_for_upload spawn_blocking join")?
 }
@@ -156,10 +159,16 @@ fn split_blocking(path: &Path, cap_bytes: u64) -> Result<Vec<PathBuf>> {
         let mut writer = BufWriter::with_capacity(64 * 1024, out);
         let mut written: u64 = 0;
         let mut wrote_any_line = false;
+        // Bytes written for the *current* in-progress line (no `\n` seen yet
+        // for this stretch). Reset to 0 every time we land on a `\n`. Used to
+        // detect lines that span multiple `fill_buf` chunks and exceed the cap.
+        let mut accumulated_no_newline: u64 = 0;
+        let mut eof = false;
 
         loop {
             let buf = reader.fill_buf().context("fill_buf")?;
             if buf.is_empty() {
+                eof = true;
                 break;
             }
             let remaining = cap_bytes.saturating_sub(written) as usize;
@@ -168,23 +177,51 @@ fn split_blocking(path: &Path, cap_bytes: u64) -> Result<Vec<PathBuf>> {
             }
             let take = remaining.min(buf.len());
             let slice = &buf[..take];
-            let last_nl = memchr::memrchr(b'\n', slice);
-            match last_nl {
+            match memchr::memrchr(b'\n', slice) {
                 Some(end_inclusive) => {
                     let upto = end_inclusive + 1;
                     writer.write_all(&slice[..upto]).context("write part")?;
                     written += upto as u64;
                     reader.consume(upto);
                     wrote_any_line = true;
+                    accumulated_no_newline = 0;
                 }
                 None => {
-                    if !wrote_any_line {
+                    if wrote_any_line {
+                        // We already have at least one complete line in this
+                        // part. Cut here, leaving the unconsumed bytes for the
+                        // next part to read.
+                        break;
+                    }
+                    if take < buf.len() {
+                        // We hit the per-part cap (`remaining`) mid-buffer with
+                        // no newline anywhere in `slice` AND more bytes still
+                        // sit in `buf` — the line is genuinely longer than the
+                        // cap.
                         anyhow::bail!(
                             "line longer than cap ({cap_bytes} B) at part {idx} of {}",
                             path.display(),
                         );
                     }
-                    break;
+                    // `take == buf.len()`: the line may continue past the
+                    // currently buffered chunk. Flush what we have, advance the
+                    // reader, and try `fill_buf` again. If the next call yields
+                    // an empty slice we're at EOF on a no-trailing-newline tail
+                    // — that's allowed and handled by the post-loop check.
+                    writer.write_all(slice).context("write part")?;
+                    written += take as u64;
+                    reader.consume(take);
+                    accumulated_no_newline += take as u64;
+                    if accumulated_no_newline > cap_bytes {
+                        // Defensive: under the current invariants this is
+                        // unreachable (`take <= remaining` keeps the running
+                        // total at or below `cap_bytes`), but we keep the guard
+                        // as a belt-and-braces line-length assertion.
+                        anyhow::bail!(
+                            "line longer than cap ({cap_bytes} B) at part {idx} of {}",
+                            path.display(),
+                        );
+                    }
                 }
             }
         }
@@ -195,10 +232,19 @@ fn split_blocking(path: &Path, cap_bytes: u64) -> Result<Vec<PathBuf>> {
             std::fs::remove_file(&part).ok();
             break;
         }
+        // If the part was filled mid-line (no newline ever landed) and there
+        // are still bytes ahead, that means a single line exceeded `cap_bytes`
+        // — bail rather than emit a part split on a non-line boundary.
+        if !wrote_any_line && !eof {
+            anyhow::bail!(
+                "line longer than cap ({cap_bytes} B) at part {idx} of {}",
+                path.display(),
+            );
+        }
         parts.push(part);
         idx += 1;
 
-        if reader.fill_buf().context("fill_buf eof check")?.is_empty() {
+        if eof || reader.fill_buf().context("fill_buf eof check")?.is_empty() {
             break;
         }
     }
