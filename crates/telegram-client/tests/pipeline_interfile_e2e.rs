@@ -98,3 +98,67 @@ async fn three_jobs_flow_in_order() {
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pipeline_processes_zip_through_disk_path() {
+    use std::io::Write;
+    use zip::write::FileOptions;
+
+    let mut zip_bytes: Vec<u8> = Vec::new();
+    {
+        let cursor = std::io::Cursor::new(&mut zip_bytes);
+        let mut zw = zip::ZipWriter::new(cursor);
+        let opts: FileOptions = FileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zw.start_file("a.txt", opts).unwrap();
+        zw.write_all(b"gmail.com:alice@x.com:pwd1\n").unwrap();
+        zw.start_file("b.gz", opts).unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(b"gmail.com:bob@x.com:pwd2\n").unwrap();
+        let gz_bytes = gz.finish().unwrap();
+        zw.write_all(&gz_bytes).unwrap();
+        zw.finish().unwrap();
+    }
+
+    let info = MessageInfo {
+        chat_id: -100, msg_id: 555,
+        original_name: "creds.zip".into(),
+        size_bytes: u64::try_from(zip_bytes.len()).unwrap(),
+        mime: Some("application/zip".into()),
+        date: 1_700_000_000,
+    };
+    let mock = MockClient::new();
+    mock.messages.lock().unwrap().insert(
+        (info.chat_id, info.msg_id),
+        (info.clone(), zip_bytes),
+    );
+    mock.script_upload(vec![UploadOutcome::Ok(50_555)]);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = cfg_with_dir(tmp.path().to_path_buf());
+
+    let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<Job>(2);
+    jobs_tx.send(Job {
+        source_chat_id: info.chat_id,
+        source_msg_id:  info.msg_id,
+        info:           info.clone(),
+    }).await.unwrap();
+    drop(jobs_tx);
+
+    let outcomes: Arc<Mutex<Vec<JobOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+    let coll = outcomes.clone();
+    let on_outcome: CursorAdvance = Arc::new(move |o| coll.lock().unwrap().push(o));
+
+    interfile::run(&mock, None, &cfg, jobs_rx, on_outcome).await.unwrap();
+
+    let got = outcomes.lock().unwrap();
+    assert_eq!(got.len(), 1);
+    assert!(matches!(got[0].kind, OutcomeKind::Uploaded { .. }), "got {:?}", got[0].kind);
+    assert_eq!(mock.uploaded.lock().unwrap().len(), 1);
+
+    // build_output_path layout: <output_dir>/<source_chat_id>/<source_msg_id>_<strip_known_ext(stem)>.out
+    let out_path = tmp.path().join("-100").join("555_creds.out");
+    let body = std::fs::read_to_string(&out_path).unwrap();
+    assert!(body.contains("alice@x.com:pwd1"));
+    assert!(body.contains("bob@x.com:pwd2"));
+}

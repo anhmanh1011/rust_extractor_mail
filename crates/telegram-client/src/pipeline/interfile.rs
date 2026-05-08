@@ -484,24 +484,137 @@ async fn handle_stream(
 }
 
 async fn handle_disk(
-    _store:  Option<&Store>,
-    _cfg:    &PipelineConfig,
+    store:   Option<&Store>,
+    cfg:     &PipelineConfig,
     job:     Job,
-    _format: Format,
-    _temp:   tempfile::NamedTempFile,
+    format:  Format,
+    temp:    tempfile::NamedTempFile,
 ) -> Stage2Out {
-    // 10a scope: zip path delegates to crate::pipeline::disk::extract_zip.
-    // This adapter is intentionally minimal — the disk-spill happy path is
-    // exercised end-to-end in Task 10.5's pipeline test (which uses a txt
-    // payload to keep the assertion graph simple). A dedicated zip E2E test
-    // lands in Chunk 6b's red-team suite (zip-bomb integration test
-    // already-existing path coverage).
-    Stage2Out::Failed {
+    use std::io::Read;
+
+    // 1. Hash the spilled compressed bytes for file-level dedup. The
+    //    compressed stream is the canonical identity here — two zips
+    //    that decompress to identical entries but have different DEFLATE
+    //    levels are treated as distinct (matches the txt/gz path which
+    //    hashes the raw download bytes pre-decompression).
+    let temp_path = temp.path().to_path_buf();
+    let sha = match tokio::task::spawn_blocking({
+        let p = temp_path.clone();
+        move || -> anyhow::Result<String> {
+            let mut f = std::fs::File::open(&p)
+                .with_context(|| format!("reopen spill {} for hashing", p.display()))?;
+            let mut h = Sha256::new();
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = f.read(&mut buf).context("read spill")?;
+                if n == 0 { break; }
+                h.update(&buf[..n]);
+            }
+            Ok(hex::encode(h.finalize()))
+        }
+    }).await {
+        Ok(Ok(s))  => s,
+        Ok(Err(e)) => return Stage2Out::Failed { job, error: e.context("hash spill") },
+        Err(e)     => return Stage2Out::Failed {
+            job,
+            error: anyhow::anyhow!("hash spill task panicked: {e}"),
+        },
+    };
+
+    // 2. Build output path + matcher (mirrors handle_stream Steps 1–3).
+    let (out_path, chat_dir) = match build_output_path(cfg, &job) {
+        Ok(p)  => p,
+        Err(e) => return Stage2Out::Failed { job, error: e },
+    };
+    if let Err(e) = std::fs::create_dir_all(&chat_dir) {
+        return Stage2Out::Failed {
+            job,
+            error: anyhow::Error::new(e).context(format!("mkdir {}", chat_dir.display())),
+        };
+    }
+    // `make_matcher` already returns `Arc<Matcher>`; do NOT wrap again.
+    let matcher = match make_matcher(cfg) {
+        Ok(m)  => m,
+        Err(e) => return Stage2Out::Failed { job, error: e },
+    };
+
+    // 3. Bridge: disk_extract wants a `Receiver<Bytes>`; we have a
+    //    NamedTempFile. Stream the spill into a synthetic receiver on a
+    //    blocking thread so disk_extract's existing read pipeline is
+    //    unchanged. blocking_send REQUIRES a multi-threaded runtime
+    //    (`#[tokio::main]` defaults to multi-thread; tests must use
+    //    `#[tokio::test(flavor = "multi_thread", worker_threads = N)]`).
+    let (bridge_tx, bridge_rx) = mpsc::channel::<Bytes>(cfg.intra_file_channel_capacity);
+    let temp_for_pump = temp_path.clone();
+    let pump_join = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut f = std::fs::File::open(&temp_for_pump)
+            .with_context(|| format!("reopen spill {} for pump", temp_for_pump.display()))?;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf).context("read spill chunk")?;
+            if n == 0 { break; }
+            let chunk = Bytes::copy_from_slice(&buf[..n]);
+            if bridge_tx.blocking_send(chunk).is_err() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    });
+
+    // 4. Run disk_extract.
+    let extract_res = crate::pipeline::disk::disk_extract(
+        bridge_rx,
+        matcher,
+        cfg.max_line_bytes,
+        cfg.max_uncompressed_bytes,
+        &out_path,
+    ).await;
+
+    // Surface pump panics AFTER disk_extract finishes (extract error wins).
+    if let Err(e) = pump_join.await {
+        if extract_res.is_ok() {
+            return Stage2Out::Failed {
+                job,
+                error: anyhow::anyhow!("zip pump task panicked: {e}"),
+            };
+        }
+    }
+
+    let stats = match extract_res {
+        Ok(s)  => s,
+        Err(e) => return Stage2Out::Failed { job, error: e },
+    };
+
+    // 5. Optional store dedup + transitions. Reuse `enqueue_and_advance` so
+    //    logging / cleanup / FileMeta construction stays symmetric with
+    //    handle_stream. `disk_extract`'s `DiskExtractStats` carries
+    //    `lines_scanned`/`lines_matched` plus extras we don't need; project
+    //    to `extractor_core::ScanStats`.
+    let scan_stats = extractor_core::ScanStats {
+        lines_scanned: stats.lines_scanned,
+        lines_matched: stats.lines_matched,
+        bytes_scanned: stats.bytes_scanned,
+    };
+    if let Some(s) = store {
+        match enqueue_and_advance(s, cfg, &job, &sha, &scan_stats, &out_path, &format) {
+            Ok(true) => {
+                drop(temp);
+                return Stage2Out::Deduped { job, sha256: sha };
+            }
+            Ok(false) => {}
+            Err(e)    => return Stage2Out::Failed { job, error: e },
+        }
+    }
+
+    // 6. RAII drop of `temp` deletes the spill at function return.
+    drop(temp);
+    Stage2Out::Ready {
         job,
-        error: anyhow::anyhow!(
-            "disk-spill (zip) Stage 2 adapter is a Chunk-6b deliverable — \
-             10a covers stream path only"
-        ),
+        sha256: sha,
+        output_path: out_path,
+        lines_scanned: stats.lines_scanned,
+        lines_matched: stats.lines_matched,
+        format,
     }
 }
 
