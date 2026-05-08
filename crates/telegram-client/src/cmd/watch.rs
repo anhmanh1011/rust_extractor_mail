@@ -1,18 +1,19 @@
-//! `watch` subcommand. Phase 8: subscribe to grammers updates for the
-//! configured `[[watch.channel]]` chats, dedup via [`Store`], dispatch each
-//! discovered document message through the existing single-message
-//! [`crate::cmd::fetch::run_with_store_and_client`] pipeline, and persist a
-//! per-chat `last_msg_id` cursor for restart safety.
-//!
-//! Sequencing: this v1 implementation is single-file in flight at a time
-//! per the chunk-level Scope note. The full §4.2 inter-file pipeline lands
-//! in Phase 10.
+//! `watch` subcommand. Phase 10: drive `pipeline::interfile::run` (one
+//! orchestrator invocation) instead of dispatching per-message through
+//! `cmd::fetch::run_with_store_and_client`. This:
+//! - Lifts the §4.2 deferral.
+//! - Records `dead_letter` rows on Failed outcomes.
+//! - Advances the cursor on EVERY outcome (including Failed) so a poison
+//!   pill doesn't make the daemon loop forever.
+//! - Preserves §6.4 gap-fill semantics: between cursor's last write and
+//!   process restart, missed history is walked oldest-first into the
+//!   pipeline before the live update stream takes over.
 //!
 //! Per-channel `[extract]` overrides (spec §7.1) are accepted by the loader
 //! but ignored at runtime in v1 — the active matcher is always
-//! `cfg.extract.{mode,key}`. Phase 10 may wire it through.
+//! `cfg.extract.{mode,key}`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::config::{AppConfig, Secrets};
 use crate::store::Store;
@@ -27,9 +28,9 @@ pub struct WatchArgs {
     #[arg(long)]
     pub duration_seconds: Option<u64>,
 
-    /// Permit uploading to a public destination chat (forwarded into the
-    /// per-message `FetchArgs`, which gates on this in `resolve_output_chat`
-    /// per spec §11.2).
+    /// Permit uploading to a public destination chat. Forwarded into the
+    /// once-at-startup output-chat resolver, which gates on this per
+    /// spec §11.2.
     #[arg(long, default_value_t = false)]
     pub confirm_public: bool,
 }
@@ -59,28 +60,88 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &WatchArgs) -> Result
     run_with_store_and_client(cfg, args, &client, &store).await
 }
 
+/// Build a [`crate::pipeline::interfile::PipelineConfig`] from the loaded
+/// [`AppConfig`] plus a resolved `target_chat_id`. Default outcomes-channel
+/// capacity is 2 (spec §4.2).
+pub(crate) fn pipeline_config_from_app(
+    cfg: &AppConfig,
+    target_chat_id: i64,
+) -> crate::pipeline::interfile::PipelineConfig {
+    const OUTCOMES_CHANNEL_CAPACITY_DEFAULT: usize = 2;
+    crate::pipeline::interfile::PipelineConfig {
+        matcher_key:                 cfg.extract.key.clone(),
+        matcher_mode: match cfg.extract.mode {
+            crate::config::ExtractMode::Plain => "plain".into(),
+            crate::config::ExtractMode::Url   => "url".into(),
+        },
+        output_dir:                  std::path::PathBuf::from(&cfg.pipeline.output_dir),
+        max_line_bytes:              cfg.pipeline.max_line_bytes,
+        max_uncompressed_bytes:      cfg.pipeline.max_uncompressed_bytes,
+        intra_file_channel_capacity: cfg.pipeline.intra_file_channel_capacity,
+        inter_file_channel_capacity: cfg.pipeline.inter_file_channel_capacity,
+        upload_channel_capacity:     cfg.pipeline.upload_channel_capacity,
+        outcomes_channel_capacity:   OUTCOMES_CHANNEL_CAPACITY_DEFAULT,
+        upload_max_size_bytes:       cfg.pipeline.upload_max_size_bytes,
+        upload_rate_seconds:         cfg.pipeline.upload_rate_seconds,
+        target_chat_id,
+    }
+}
+
+/// Best-effort format classification by filename suffix. Returned tag
+/// matches the `format` column of `dead_letter` rows.
+pub(crate) fn classify_format(info: &crate::telegram::MessageInfo) -> &'static str {
+    let lower = info.original_name.to_ascii_lowercase();
+    if lower.ends_with(".txt") {
+        "txt"
+    } else if lower.ends_with(".gz") {
+        "gz"
+    } else if lower.ends_with(".zip") {
+        "zip"
+    } else {
+        "unknown"
+    }
+}
+
+/// Best-effort stage classification by error chain. Returned tag matches
+/// the `stage` column of `dead_letter` rows.
+pub(crate) fn classify_stage(err: &anyhow::Error) -> &'static str {
+    let s = format!("{err:#}").to_ascii_lowercase();
+    if s.contains("download") || s.contains("transport") {
+        "download"
+    } else if s.contains("upload") || s.contains("flood") {
+        "upload"
+    } else {
+        "extract"
+    }
+}
+
+/// Render an anyhow error chain as a single line for `dead_letter.error`.
+pub(crate) fn one_line(err: &anyhow::Error) -> String {
+    format!("{err:#}").replace('\n', " | ")
+}
+
 /// Generic watch implementation. Caller supplies the [`TelegramClient`] and
 /// the [`Store`]; used both by [`run`] and by `tests/cmd_watch.rs`.
 ///
 /// Flow:
-/// 1. Warm the client (no-op for `MockClient`; warms dialogs for the real client).
-/// 2. Resolve every `[[watch.channel]]` entry to a numeric chat id (via
-///    `client.resolve_chat` for the username variant).
-/// 3. Open the live update stream for those chat ids.
-/// 4. Loop: select on the next update, Ctrl-C, or the optional
-///    `--duration-seconds` deadline. On stream close, exit Ok(()).
-/// 5. Per message: synthesize a `FetchArgs { chat, msg_id, no_upload=false,
-///    confirm_public }` and call
-///    [`crate::cmd::fetch::run_with_store_and_client`]. On Ok (including
-///    dedup short-circuit `AlreadyDone`), advance
-///    `update_watch_cursor(chat_id, &title, i64::from(msg_id))`. On Err,
-///    log at `tracing::error!` and continue — never bail.
+/// 1. Warm the client.
+/// 2. Resolve every `[[watch.channel]]` entry to a numeric chat id.
+/// 3. Resolve the output chat once at startup (spec §11.2 public-chat gate).
+/// 4. Spawn the inter-file orchestrator; jobs come from `(jobs_tx, jobs_rx)`.
+/// 5. Gap-fill: per chat, walk history newest→oldest until cursor, then
+///    push oldest-first onto `jobs_tx`.
+/// 6. Drive the live update stream via `subscribe_with_reconnect`; each
+///    message info becomes a `Job` pushed onto `jobs_tx`.
+/// 7. After the feeder returns, drop `jobs_tx` so the orchestrator drains.
+/// 8. Await the orchestrator handle.
 pub async fn run_with_store_and_client<C: TelegramClient>(
-    cfg: &AppConfig,
-    args: &WatchArgs,
+    cfg:    &AppConfig,
+    args:   &WatchArgs,
     client: &C,
-    store: &Store,
+    store:  &Store,
 ) -> Result<()> {
+    use crate::pipeline::interfile::{self, CursorAdvance, Job, JobOutcome, OutcomeKind};
+
     client
         .connect_and_warm()
         .await
@@ -112,144 +173,166 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         chat_ids.push(id);
     }
 
-    // 2a. Gap-fill: walk history backwards from the latest message until
-    //     msg_id ≤ cursor (or page returns empty). Done per chat,
-    //     newest-first to preserve a sensible processing order on restart.
-    //     Spec §6.4: between watch_cursor's last write and process restart,
-    //     messages posted to subscribed chats would be missed by
-    //     subscribe_updates alone — close that window here.
-    //
-    //     v1 limitation: `stack` is unbounded — a long outage on a high-
-    //     volume channel (millions of messages above cursor) will buffer the
-    //     full gap before processing. Acceptable in v1 because each
-    //     `MessageInfo` is ~100 bytes and the spec §6.4 recovery model
-    //     assumes operator restart cadence on the order of hours, not weeks.
-    //     A page-by-page processing variant is tracked for future hardening.
-    for &chat_id in &chat_ids {
-        let cursor = store
-            .watch_cursor(chat_id)
-            .with_context(|| format!("watch_cursor chat={chat_id}"))?
-            .unwrap_or(0);
-        let page_size = cfg.backfill.page_size.max(1); // reuse the same knob
-        let mut next_max: Option<i32> = None;
-        let mut stack: Vec<crate::telegram::MessageInfo> = Vec::new();
-        loop {
-            let page = client
-                .iter_history(chat_id, next_max, page_size)
-                .await
-                .with_context(|| {
-                    format!("gap-fill iter_history chat={chat_id} max={next_max:?}")
-                })?;
-            if page.is_empty() {
-                break;
-            }
+    // 2. Resolve output chat ONCE at startup; bail before any download if
+    //    the public-chat gate trips (spec §11.2).
+    let target_chat_id = crate::cmd::fetch::resolve_output_chat_for_watch(
+        cfg,
+        args.confirm_public,
+        client,
+    )
+    .await
+    .context("watch: resolve output chat")?
+    .ok_or_else(|| anyhow!("watch: telegram.output.{{chat,chat_id}} unset"))?;
 
-            // Stop once we cross the cursor. The page is descending, so the
-            // first msg_id <= cursor (and everything after it) is already
-            // processed.
-            let mut crossed = false;
-            for info in &page {
-                if i64::from(info.msg_id) <= cursor {
-                    crossed = true;
-                    break;
-                }
-                stack.push(info.clone());
-            }
-            if crossed {
-                break;
-            }
-            // Continue paging older.
-            next_max = page.last().map(|m| m.msg_id);
-        }
+    // 3. Build PipelineConfig and the (jobs_tx, jobs_rx) channel.
+    let pcfg = pipeline_config_from_app(cfg, target_chat_id);
+    let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<Job>(2);
 
-        // Process oldest-first so cursor advances monotonically.
-        stack.reverse();
-        // `chat_id` is loop-invariant inside this inner pass; build the
-        // cursor title once per outer iteration to skip a per-message alloc.
-        let title = format!("chat:{chat_id}");
-        for info in stack {
-            let synth = crate::cmd::fetch::FetchArgs {
-                link:           None,
-                chat:           Some(info.chat_id),
-                msg_id:         Some(info.msg_id),
-                no_upload:      false,
-                confirm_public: args.confirm_public,
-            };
-            let cid = info.chat_id;
-            let mid = info.msg_id;
-            match crate::cmd::fetch::run_with_store_and_client(cfg, &synth, client, Some(store))
-                .await
-            {
-                Ok(()) => {
-                    if let Err(e) = store.update_watch_cursor(cid, &title, i64::from(mid)) {
-                        tracing::error!(
-                            ?e,
-                            chat_id = cid,
-                            msg_id = mid,
-                            "watch: gap-fill cursor write failed",
-                        );
-                    }
-                }
-                Err(e) => {
+    // 4. CursorAdvance callback: persist watch_cursor on every outcome,
+    //    record dead_letter on Failed. Advances the cursor past Failed
+    //    so the daemon doesn't loop on a poison message.
+    let store_arc: std::sync::Arc<Store> = std::sync::Arc::new(store.clone_handle());
+    let cb_store = store_arc.clone();
+    let advance: CursorAdvance = std::sync::Arc::new(move |o: JobOutcome| {
+        let chat_id = o.job.source_chat_id;
+        let msg_id  = o.job.source_msg_id;
+        match &o.kind {
+            OutcomeKind::Uploaded { .. } | OutcomeKind::Deduped { .. } => {
+                let title = format!("chat:{chat_id}");
+                if let Err(e) =
+                    cb_store.update_watch_cursor(chat_id, &title, i64::from(msg_id))
+                {
                     tracing::error!(
                         ?e,
-                        chat_id = cid,
-                        msg_id = mid,
-                        "watch: gap-fill per-message failed, continuing",
+                        chat_id,
+                        msg_id,
+                        "watch: failed to advance cursor",
+                    );
+                }
+            }
+            OutcomeKind::Failed { error } => {
+                // Dead-letter the failed message, then advance the cursor
+                // past it so the daemon doesn't loop on this poison pill.
+                let err = anyhow::anyhow!(error.clone());
+                if let Err(e) = cb_store.record_dead_letter(
+                    chat_id,
+                    msg_id,
+                    None,
+                    &o.job.info.original_name,
+                    o.job.info.size_bytes,
+                    classify_format(&o.job.info),
+                    classify_stage(&err),
+                    &one_line(&err),
+                ) {
+                    tracing::error!(
+                        ?e,
+                        chat_id,
+                        msg_id,
+                        "watch: failed to record dead_letter",
+                    );
+                }
+                let title = format!("chat:{chat_id}");
+                if let Err(e) =
+                    cb_store.update_watch_cursor(chat_id, &title, i64::from(msg_id))
+                {
+                    tracing::error!(
+                        ?e,
+                        chat_id,
+                        msg_id,
+                        "watch: failed to advance cursor past dead-letter",
                     );
                 }
             }
         }
-    }
+    });
 
-    // 2. Drive the live update stream with auto-reconnect on closure.
-    //    Per-message dispatch and cursor advance happen inside the closure;
-    //    `subscribe_with_reconnect` handles re-subscribing on stream close,
-    //    exponential backoff (1 s → 30 s cap), and honors --duration-seconds
-    //    + Ctrl-C.
-    let deadline = args
-        .duration_seconds
-        .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
-    let confirm_public = args.confirm_public;
-    subscribe_with_reconnect(client, &chat_ids, deadline, |info| async move {
-        let chat_id = info.chat_id;
-        let msg_id = info.msg_id;
-        let synth = crate::cmd::fetch::FetchArgs {
-            link: None,
-            chat: Some(chat_id),
-            msg_id: Some(msg_id),
-            no_upload: false,
-            confirm_public,
-        };
-        match crate::cmd::fetch::run_with_store_and_client(cfg, &synth, client, Some(store)).await {
-            Ok(()) => {
-                // Cursor advances on every observed message — including
-                // dedup hits (AlreadyDone returns Ok). Title is best-effort:
-                // we don't have it on `MessageInfo`, so reuse the
-                // configured chat id; `update_watch_cursor` requires a
-                // title. Fall back to the numeric id stringified — Phase 10
-                // can pull a real title via `iter_dialogs`.
-                let title = format!("chat:{chat_id}");
-                if let Err(e) = store.update_watch_cursor(chat_id, &title, i64::from(msg_id)) {
-                    tracing::error!(?e, chat_id, msg_id, "watch: failed to advance cursor");
+    // 5. Run the orchestrator concurrently with the feeder. The
+    //    orchestrator borrows `&C` and `Option<&Store>`, so we use
+    //    `tokio::join!` instead of `tokio::spawn` to avoid 'static bounds.
+    let pipeline_fut = async {
+        interfile::run(client, Some(store_arc.as_ref()), &pcfg, jobs_rx, advance).await
+    };
+
+    let feed_fut = async {
+        // 5a. Gap-fill per chat — newest→oldest until cursor, then push
+        //     oldest-first into jobs_tx (spec §6.4). Without this, messages
+        //     posted between the last cursor write and process restart would
+        //     be missed by `subscribe_updates` alone.
+        for &chat_id in &chat_ids {
+            let cursor = store
+                .watch_cursor(chat_id)
+                .with_context(|| format!("watch_cursor chat={chat_id}"))?
+                .unwrap_or(0);
+            let page_size = cfg.backfill.page_size.max(1);
+            let mut next_max: Option<i32> = None;
+            let mut stack: Vec<crate::telegram::MessageInfo> = Vec::new();
+            loop {
+                let page = client
+                    .iter_history(chat_id, next_max, page_size)
+                    .await
+                    .with_context(|| {
+                        format!("gap-fill iter_history chat={chat_id} max={next_max:?}")
+                    })?;
+                if page.is_empty() {
+                    break;
+                }
+                let mut crossed = false;
+                for info in &page {
+                    if i64::from(info.msg_id) <= cursor {
+                        crossed = true;
+                        break;
+                    }
+                    stack.push(info.clone());
+                }
+                if crossed {
+                    break;
+                }
+                next_max = page.last().map(|m| m.msg_id);
+            }
+            stack.reverse();
+            for info in stack {
+                let job = Job {
+                    source_chat_id: info.chat_id,
+                    source_msg_id:  info.msg_id,
+                    info,
+                };
+                if jobs_tx.send(job).await.is_err() {
+                    // Orchestrator died; cooperate by exiting cleanly.
+                    return Ok::<(), anyhow::Error>(());
                 }
             }
-            Err(e) => {
-                // Per-message failures are logged and skipped; the daemon
-                // does NOT exit on a single bad file. The row's status in
-                // the store reflects partial progress, and a restart's
-                // `reset_in_flight` (Task 7.3) will retry.
-                tracing::error!(
-                    ?e,
-                    chat_id,
-                    msg_id,
-                    "watch: per-message processing failed, continuing",
-                );
-            }
         }
+
+        // 5b. Live updates with reconnect. Each scripted/live message becomes
+        //     a Job pushed onto jobs_tx. On send error (orchestrator hung
+        //     up) return Err to terminate the reconnect loop.
+        let deadline = args
+            .duration_seconds
+            .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
+        let jobs_tx_for_live = jobs_tx.clone();
+        subscribe_with_reconnect(client, &chat_ids, deadline, |info| {
+            let tx = jobs_tx_for_live.clone();
+            async move {
+                let job = Job {
+                    source_chat_id: info.chat_id,
+                    source_msg_id:  info.msg_id,
+                    info,
+                };
+                tx.send(job)
+                    .await
+                    .map_err(|_| anyhow!("watch: pipeline orchestrator closed jobs_rx"))
+            }
+        })
+        .await?;
+
+        // 5c. Drop the feeder's sender so the orchestrator drains.
+        drop(jobs_tx);
         Ok(())
-    })
-    .await
+    };
+
+    let (feed_res, run_res) = tokio::join!(feed_fut, pipeline_fut);
+    feed_res?;
+    run_res
 }
 
 /// Drive `client.subscribe_updates(chat_ids)` with reconnect-on-closure.

@@ -618,6 +618,25 @@ async fn resolve_output_chat<C: TelegramClient>(
     args: &FetchArgs,
     client: &C,
 ) -> Result<Option<i64>> {
+    resolve_output_chat_inner(cfg, args.confirm_public, client).await
+}
+
+/// Sibling of [`resolve_output_chat`] used by `cmd::watch`, which doesn't
+/// build a [`FetchArgs`] for the once-at-startup output-chat resolution.
+/// Same semantics: public-chat heuristic + spec §11.2 gate.
+pub async fn resolve_output_chat_for_watch<C: TelegramClient>(
+    cfg:            &AppConfig,
+    confirm_public: bool,
+    client:         &C,
+) -> Result<Option<i64>> {
+    resolve_output_chat_inner(cfg, confirm_public, client).await
+}
+
+async fn resolve_output_chat_inner<C: TelegramClient>(
+    cfg:            &AppConfig,
+    confirm_public: bool,
+    client:         &C,
+) -> Result<Option<i64>> {
     if let Some(id) = cfg.telegram.output.chat_id {
         return Ok(Some(id));
     }
@@ -629,7 +648,7 @@ async fn resolve_output_chat<C: TelegramClient>(
         return Ok(None);
     }
     let looks_public = trimmed.starts_with('@') || trimmed.parse::<i64>().is_err();
-    if looks_public && !args.confirm_public {
+    if looks_public && !confirm_public {
         bail!(
             "telegram.output.chat = {trimmed:?} looks public; pass --confirm-public to upload there \
              (spec §11.2: public outputs require explicit acknowledgement)",

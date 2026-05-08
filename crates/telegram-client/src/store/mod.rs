@@ -2,7 +2,7 @@
 //! Store calls in `tokio::task::spawn_blocking`.
 
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -10,11 +10,13 @@ use rusqlite::Connection;
 
 const SCHEMA_SQL: &str = include_str!("schema.sql");
 
-/// SQLite-backed state store. Owns a `Mutex<Connection>` so callers can
-/// share the store across threads. All methods block; async callers wrap
-/// each call in `tokio::task::spawn_blocking`.
+/// SQLite-backed state store. Owns an `Arc<Mutex<Connection>>` so callers can
+/// share the store across threads AND clone cheap handles into owned
+/// closures (e.g. the `CursorAdvance` callback in `cmd::watch` /
+/// `cmd::backfill`). All methods block; async callers wrap each call in
+/// `tokio::task::spawn_blocking`.
 pub struct Store {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl Store {
@@ -40,13 +42,24 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", true).context("set foreign_keys")?;
         // Migrations.
         conn.execute_batch(SCHEMA_SQL).context("apply schema.sql")?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     /// Test/observability accessor — production code uses the typed methods
     /// added in Tasks 7.2-7.5.
     pub fn lock(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("store mutex poisoned")
+    }
+
+    /// A second `Store` handle that shares the same SQLite connection (and
+    /// therefore the same WAL view, the same lock, the same in-flight
+    /// transaction state). Cheap: clones an `Arc` internally — no SQLite-side
+    /// cost. Used when the caller needs to move the store into an owned
+    /// closure (e.g., the `CursorAdvance` callback in `cmd::watch` /
+    /// `cmd::backfill`). Both handles contend on the same `Mutex<Connection>`
+    /// lock; v1 write traffic is low.
+    pub fn clone_handle(&self) -> Store {
+        Store { conn: self.conn.clone() }
     }
 }
 

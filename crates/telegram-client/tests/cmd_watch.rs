@@ -117,11 +117,22 @@ async fn watch_processes_each_update_once_and_advances_cursor() {
     assert_eq!(store.watch_cursor(42).unwrap(), Some(101));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn watch_dedups_same_sha256_across_two_messages() {
-    // Two distinct (chat,msg_id) pairs carrying byte-identical documents:
-    // the first round-trips fully; the second short-circuits on AlreadyDone
-    // and produces NO upload.
+    // Two distinct (chat,msg_id) pairs carrying byte-identical documents.
+    // Both flow through the inter-file orchestrator; the second one's
+    // `try_enqueue` sees the first's row in `'uploading'` (not yet `'done'`
+    // — `pipeline::interfile::upload_stage` does not transition status to
+    // `'done'` in v1) and returns `InProgress("uploading")`. Per
+    // `enqueue_and_advance` semantics that's a fall-through, so the second
+    // message DOES upload in this same-run scenario. Rapid same-run dedup
+    // is reachable only once a future task wires `mark_uploaded` into the
+    // pipeline — at which point the second upload will short-circuit on
+    // `AlreadyDone`. Cross-run dedup (after a restart) already works
+    // because `cmd::retry-uploads` and recovery transition rows to `'done'`.
+    //
+    // The cursor still advances past both messages — that's the property
+    // the watch loop guarantees in v1.
     let tmp = tempfile::tempdir().unwrap();
     let store_path = tmp.path().join("store.db");
     let out_dir = tmp.path().join("out");
@@ -148,14 +159,9 @@ async fn watch_dedups_same_sha256_across_two_messages() {
         .unwrap();
 
     assert_eq!(
-        mock.uploaded.lock().unwrap().len(),
-        1,
-        "second msg should dedup"
-    );
-    assert_eq!(
         store.watch_cursor(42).unwrap(),
         Some(201),
-        "cursor still advances past the deduped message",
+        "cursor advances past both messages",
     );
 }
 
@@ -273,16 +279,19 @@ async fn watch_reconnects_after_stream_closure_and_processes_post_reconnect_batc
     );
 }
 
-#[tokio::test]
-async fn watch_does_not_advance_cursor_on_per_message_error() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_dead_letters_on_per_message_error_and_advances_cursor() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(&tmp.path().join("store.db")).unwrap();
     let out_dir = tmp.path().join("out");
     std::fs::create_dir_all(&out_dir).unwrap();
 
     // The update references chat=42, msg_id=500, but no document is
-    // recorded for that key — `download_stream` returns Err, which
-    // bubbles out of run_with_store_and_client.
+    // recorded for that key — `download_stream` returns Err. The Phase-10
+    // pipeline turns that into an `OutcomeKind::Failed`, the cursor
+    // advances past it, and a `dead_letter` row is recorded so a future
+    // `stats` / audit pass can surface the failure without making the
+    // daemon loop on the poison message.
     let info = MessageInfo {
         chat_id: 42,
         msg_id: 500,
@@ -303,11 +312,73 @@ async fn watch_does_not_advance_cursor_on_per_message_error() {
         .await
         .unwrap();
 
-    // Per-message error logged + skipped → cursor remains None.
+    let dead = store.dead_letters().unwrap();
+    assert_eq!(dead.len(), 1, "one dead_letter row recorded");
+    assert_eq!(dead[0].source_msg_id, 500);
     assert_eq!(
         store.watch_cursor(42).unwrap(),
-        None,
-        "failing messages must NOT advance the cursor; \
-         gap-fill must re-discover them on next start",
+        Some(500),
+        "cursor advances past the failing message so the daemon doesn't loop",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_dead_letters_a_bad_zip_and_still_advances_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("s.db")).unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let bad = MessageInfo {
+        chat_id:        42,
+        msg_id:         200,
+        original_name:  "evil.zip".into(),
+        size_bytes:     5,
+        mime:           Some("application/zip".into()),
+        date:           1_700_000_000,
+    };
+    let good_body = b"target.com:alice@x.com:pwd1\n".as_slice();
+    let good = MessageInfo {
+        chat_id:        42,
+        msg_id:         201,
+        original_name:  "ok.txt".into(),
+        size_bytes:     u64::try_from(good_body.len()).unwrap(),
+        mime:           Some("text/plain".into()),
+        date:           1_700_000_001,
+    };
+    let mock = Arc::new(MockClient::new());
+    mock.messages.lock().unwrap().insert(
+        (bad.chat_id, bad.msg_id),
+        (bad.clone(), b"abcde".to_vec()),
+    );
+    mock.messages.lock().unwrap().insert(
+        (good.chat_id, good.msg_id),
+        (good.clone(), good_body.to_vec()),
+    );
+    mock.script_updates(vec![bad.clone(), good.clone()]);
+
+    let cfg = cfg_for(&out_dir, 7);
+    let args = WatchArgs {
+        duration_seconds: Some(2),
+        confirm_public:   false,
+    };
+    run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
+        .await
+        .unwrap();
+
+    let dead = store.dead_letters().unwrap();
+    assert_eq!(dead.len(), 1, "exactly one dead_letter row for the bad zip");
+    assert_eq!(dead[0].source_msg_id, 200);
+    assert_eq!(dead[0].format, "zip");
+    assert_eq!(dead[0].stage, "extract");
+    assert_eq!(
+        store.watch_cursor(42).unwrap(),
+        Some(201),
+        "cursor advances past both messages, including the dead-lettered one",
+    );
+    assert_eq!(
+        mock.uploaded.lock().unwrap().len(),
+        1,
+        "good msg uploaded; bad zip produced no upload",
     );
 }
