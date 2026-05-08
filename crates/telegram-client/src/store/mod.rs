@@ -469,3 +469,112 @@ impl Store {
         Ok(())
     }
 }
+
+/// A row in `dead_letter` — a forensic record of a job whose source is
+/// unrecoverable (corrupt download bytes, zip-bomb cap, path-traversal entry,
+/// OOM-at-extract). Distinct from [`FailedUpload`], which is the retryable
+/// queue surfaced by `cmd::retry-uploads`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetter {
+    /// Auto-increment primary key.
+    pub id:             i64,
+    /// Telegram chat the source message lives in.
+    pub source_chat_id: i64,
+    /// Telegram message id carrying the source document.
+    pub source_msg_id:  i32,
+    /// Hex-encoded SHA-256 of the source file. `None` when the failure
+    /// happened before any bytes hashed (download torn, etc.).
+    pub sha256:         Option<String>,
+    /// Original file name as posted on Telegram.
+    pub original_name:  String,
+    /// Source size in bytes (stored as `INTEGER` in SQLite).
+    pub size_bytes:     u64,
+    /// File format tag — one of `"txt"`, `"gz"`, `"zip"`.
+    pub format:         String,
+    /// Pipeline stage where the failure occurred (`"download"`, `"extract"`, …).
+    pub stage:          String,
+    /// Human-readable error chain captured at failure time.
+    pub error:          String,
+    /// Unix-seconds timestamp when the row was recorded.
+    pub recorded_at:    i64,
+}
+
+impl Store {
+    /// Append a `dead_letter` row. Distinct invocations on the same
+    /// `(source_chat_id, source_msg_id)` MUST produce distinct rows so the
+    /// audit trail is preserved (no UPSERT). `sha256` is `None` when the
+    /// failure happened before any bytes hashed (download torn, etc.).
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_dead_letter(
+        &self,
+        source_chat_id: i64,
+        source_msg_id:  i32,
+        sha256:         Option<String>,
+        original_name:  &str,
+        size_bytes:     u64,
+        format:         &str,
+        stage:          &str,
+        error:          &str,
+    ) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO dead_letter (source_chat_id, source_msg_id, sha256,
+                                      original_name, size_bytes, format,
+                                      stage, error, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                source_chat_id,
+                source_msg_id,
+                sha256,
+                original_name,
+                i64::try_from(size_bytes).unwrap_or(i64::MAX),
+                format,
+                stage,
+                error,
+                now_secs(),
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "INSERT INTO dead_letter source=({source_chat_id},{source_msg_id})"
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Read every dead_letter row, oldest-first. Used by Phase 11's
+    /// `stats` subcommand and by tests; production callers do not consume
+    /// the dead-letter table outside of audit/CLI surface.
+    pub fn dead_letters(&self) -> Result<Vec<DeadLetter>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, source_chat_id, source_msg_id, sha256,
+                        original_name, size_bytes, format, stage, error, recorded_at
+                   FROM dead_letter
+                  ORDER BY id ASC",
+            )
+            .context("prepare SELECT dead_letter")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DeadLetter {
+                    id:             r.get(0)?,
+                    source_chat_id: r.get(1)?,
+                    source_msg_id:  r.get(2)?,
+                    sha256:         r.get(3)?,
+                    original_name:  r.get(4)?,
+                    size_bytes:     u64::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
+                    format:         r.get(6)?,
+                    stage:          r.get(7)?,
+                    error:          r.get(8)?,
+                    recorded_at:    r.get(9)?,
+                })
+            })
+            .context("query dead_letter")?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.context("row read")?);
+        }
+        Ok(out)
+    }
+}

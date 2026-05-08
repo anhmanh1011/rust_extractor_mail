@@ -49,4 +49,24 @@ CREATE TABLE IF NOT EXISTS failed_uploads (
 
 CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
 INSERT OR IGNORE INTO schema_version VALUES (1);
+
+-- ─────────────────────────── v2 migration ───────────────────────────
+-- Forensic destination for jobs whose source is unrecoverable (corrupt
+-- download bytes, zip-bomb cap, path-traversal entry, OOM-at-extract).
+-- Distinct from failed_uploads, which holds RETRYABLE upload errors.
+CREATE TABLE IF NOT EXISTS dead_letter (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_chat_id  INTEGER NOT NULL,
+    source_msg_id   INTEGER NOT NULL,
+    sha256          TEXT,
+    original_name   TEXT    NOT NULL,
+    size_bytes      INTEGER NOT NULL,
+    format          TEXT    NOT NULL,
+    stage           TEXT    NOT NULL,
+    error           TEXT    NOT NULL,
+    recorded_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dead_letter_source ON dead_letter(source_chat_id, source_msg_id);
+
+INSERT OR IGNORE INTO schema_version VALUES (2);
 COMMIT;
