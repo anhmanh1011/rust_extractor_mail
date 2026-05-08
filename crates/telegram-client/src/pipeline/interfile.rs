@@ -21,7 +21,7 @@
 //! Tasks 10.2 / 10.3 / 10.4 wire Stage 1 / Stage 2 / Stage 3 in turn.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -653,7 +653,18 @@ pub async fn upload_stage<C: TelegramClient + ?Sized>(
                 }
                 drop(in_tx);
 
-                let on_failed = |_j: UploadJob, _e: anyhow::Error| {};
+                // Capture the permanent-failure error from `upload::run`'s
+                // `on_failed` callback so the resulting `OutcomeKind::Failed`
+                // surfaces the real error chain rather than the generic
+                // "no outcome" sentinel. `upload::run` requires
+                // `F: FnMut + Send + 'static`, so the closure owns a clone
+                // of the slot.
+                let captured_err: Arc<Mutex<Option<anyhow::Error>>> =
+                    Arc::new(Mutex::new(None));
+                let captured_err_cb = captured_err.clone();
+                let on_failed = move |_j: UploadJob, e: anyhow::Error| {
+                    *captured_err_cb.lock().unwrap() = Some(e);
+                };
                 let upload_run = upload::run(client, in_rx, out_tx, &upload_cfg, on_failed);
                 let drainer    = async { out_rx.recv().await };
                 let (upload_res, outcome_opt) = tokio::join!(upload_run, drainer);
@@ -671,10 +682,20 @@ pub async fn upload_stage<C: TelegramClient + ?Sized>(
                         OutcomeKind::Failed {
                             error: format!("upload skipped ({reason}) for {sha256}"),
                         },
-                    None =>
-                        OutcomeKind::Failed {
-                            error: "upload produced no outcome (permanent failure)".into(),
-                        },
+                    None => {
+                        // `out_tx` was dropped without a `Done`/`Skipped` send.
+                        // That can only happen via the `on_failed` path inside
+                        // `upload::run`, so the captured error is the real
+                        // diagnostic; fall back to the generic sentinel only
+                        // if the slot is unexpectedly empty.
+                        let err = captured_err.lock().unwrap().take();
+                        let msg = err
+                            .map(|e| format!("{e:#}"))
+                            .unwrap_or_else(|| {
+                                "upload produced no outcome (permanent failure)".into()
+                            });
+                        OutcomeKind::Failed { error: msg }
+                    }
                 };
                 on_outcome(JobOutcome { job, kind });
             }
