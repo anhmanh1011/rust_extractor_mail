@@ -47,7 +47,7 @@ where
 {
     let (bridge_tx, bridge_rx) = sync_channel::<Bytes>(BRIDGE_CAPACITY);
 
-    let worker = tokio::task::spawn_blocking(move || -> Result<(W, ScanStats)> {
+    let mut worker = tokio::task::spawn_blocking(move || -> Result<(W, ScanStats)> {
         let mut sink = WriterSink::new(writer);
         let mut scanner = Scanner::with_max_line(&matcher, max_line_bytes);
         let stats = if is_gzip {
@@ -59,7 +59,7 @@ where
         Ok((inner, stats))
     });
 
-    let pump = tokio::spawn(async move {
+    let mut pump = tokio::spawn(async move {
         while let Some(c) = chunks.recv().await {
             let tx = bridge_tx.clone();
             let send_res = tokio::task::spawn_blocking(move || tx.send(c)).await;
@@ -67,7 +67,8 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => break, // worker died / dropped its receiver
                 Err(join_err) => {
-                    return Err(anyhow::anyhow!("bridge pump join: {join_err}"));
+                    return Err(anyhow::Error::new(join_err)
+                        .context("bridge pump send task panicked"));
                 }
             }
         }
@@ -75,9 +76,20 @@ where
         Ok::<_, anyhow::Error>(())
     });
 
-    let pump_res = pump.await.context("bridge pump task panicked")?;
-    let (out, stats) = worker.await.context("scanner thread panicked")??;
-    pump_res?;
+    // Race the two halves: if the worker errors mid-stream while the upstream
+    // tokio sender stalls, the pump would otherwise block forever on
+    // `chunks.recv().await`. Whichever finishes first, we abort the other.
+    let (out, stats) = tokio::select! {
+        worker_res = &mut worker => {
+            pump.abort();
+            let _ = (&mut pump).await;
+            worker_res.context("scanner thread panicked")??
+        }
+        pump_res = &mut pump => {
+            pump_res.context("bridge pump task panicked")??;
+            worker.await.context("scanner thread panicked")??
+        }
+    };
     Ok((out, stats))
 }
 
@@ -91,11 +103,11 @@ fn run_plain<W: Write>(
         match rx.recv() {
             Ok(buf) => {
                 let s = scanner.feed(&buf, sink).context("scanner.feed")?;
-                accumulate(&mut total, &s);
+                total += s;
             }
             Err(RecvError) => {
                 let s = scanner.finish(sink).context("scanner.finish")?;
-                accumulate(&mut total, &s);
+                total += s;
                 return Ok(total);
             }
         }
@@ -114,18 +126,12 @@ fn run_gz<W: Write>(
         let n = decoder.read(&mut buf).context("gz decode")?;
         if n == 0 {
             let s = scanner.finish(sink).context("scanner.finish")?;
-            accumulate(&mut total, &s);
+            total += s;
             return Ok(total);
         }
         let s = scanner.feed(&buf[..n], sink).context("scanner.feed")?;
-        accumulate(&mut total, &s);
+        total += s;
     }
-}
-
-fn accumulate(total: &mut ScanStats, delta: &ScanStats) {
-    total.lines_scanned += delta.lines_scanned;
-    total.lines_matched += delta.lines_matched;
-    total.bytes_scanned += delta.bytes_scanned;
 }
 
 /// `Read`-implementing adapter over `std::sync::mpsc::Receiver<Bytes>`.
