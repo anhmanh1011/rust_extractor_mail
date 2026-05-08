@@ -4,8 +4,27 @@ use super::*;
 use anyhow::Result;
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
+
+/// Scripted outcome for a single `upload_file` call on [`MockClient`].
+///
+/// Push outcomes via [`MockClient::script_upload`]; they are consumed FIFO.
+/// When the queue is empty, `upload_file` succeeds and auto-allocates a
+/// monotonically-increasing id from `MockClient::next_msg_id`.
+#[derive(Debug, Clone)]
+pub enum UploadOutcome {
+    /// Succeed and assign this specific output message id.
+    Ok(i64),
+    /// Simulate a `FLOOD_WAIT_<n>` transient — caller should back off and retry.
+    FloodWait {
+        /// Seconds to wait per the simulated `FLOOD_WAIT` response.
+        seconds: u32,
+    },
+    /// Permanent failure with the given message.
+    Permanent(String),
+}
 
 /// Test fixture. Pre-populate via the `with_*` builders before passing into
 /// the code under test.
@@ -17,8 +36,9 @@ pub struct MockClient {
     pub messages: Mutex<HashMap<(i64, i32), (MessageInfo, Vec<u8>)>>,
     /// Invite links the mock has accepted via `join_invite_link`.
     pub joined: Mutex<Vec<String>>,
-    /// Files passed to `upload_file`, recorded as `(chat, path, caption)`.
-    pub uploaded: Mutex<Vec<(i64, std::path::PathBuf, Option<String>)>>,
+    /// Files passed to `upload_file`, recorded as `(chat, path, caption, output_msg_id)`.
+    #[allow(clippy::type_complexity)]
+    pub uploaded: Mutex<Vec<(i64, std::path::PathBuf, Option<String>, i64)>>,
     /// Per-`(chat_id, msg_id)` scripted chunk sequences for `download_stream`.
     ///
     /// Each entry is a `Vec` of `Result<Bytes>` items consumed (drained) on
@@ -26,6 +46,14 @@ pub struct MockClient {
     /// is forwarded the channel is closed immediately.
     #[allow(clippy::type_complexity)]
     pub download_scripts: Mutex<HashMap<(i64, i32), Vec<anyhow::Result<Bytes>>>>,
+    /// Monotonic id source for `upload_file` outputs.
+    ///
+    /// Used when no [`UploadOutcome::Ok`] is scripted via [`MockClient::script_upload`].
+    /// Starts at 1 000 and increases by 1 for each auto-allocated call.
+    /// Concurrent callers see distinct ids because `fetch_add` is atomic.
+    next_msg_id: AtomicI64,
+    /// Scripted upload outcomes, drained FIFO. Empty = success with auto-allocated id.
+    upload_script: Mutex<std::collections::VecDeque<UploadOutcome>>,
 }
 
 impl MockClient {
@@ -37,7 +65,18 @@ impl MockClient {
             joined: Mutex::new(Vec::new()),
             uploaded: Mutex::new(Vec::new()),
             download_scripts: Mutex::new(HashMap::new()),
+            next_msg_id: AtomicI64::new(1_000),
+            upload_script: Mutex::new(std::collections::VecDeque::new()),
         }
+    }
+
+    /// Push a sequence of upload outcomes consumed FIFO by `upload_file`.
+    ///
+    /// Calling this method replaces any prior script. Once the queue is
+    /// exhausted, subsequent `upload_file` calls succeed with auto-allocated
+    /// ids from the internal monotonic counter.
+    pub fn script_upload(&self, outcomes: Vec<UploadOutcome>) {
+        *self.upload_script.lock().unwrap() = outcomes.into();
     }
 
     /// Builder: append a dialog to the mock's dialog list.
@@ -65,12 +104,7 @@ impl MockClient {
     /// for that key pair. Any prior script for the same key is replaced.
     /// After a scripted `Err` entry is forwarded the channel is closed,
     /// even if further entries remain in the script.
-    pub fn script_download(
-        &self,
-        chat_id: i64,
-        msg_id: i32,
-        chunks: Vec<anyhow::Result<Bytes>>,
-    ) {
+    pub fn script_download(&self, chat_id: i64, msg_id: i32, chunks: Vec<anyhow::Result<Bytes>>) {
         self.download_scripts
             .lock()
             .unwrap()
@@ -190,12 +224,34 @@ impl TelegramClient for MockClient {
         target_chat_id: i64,
         local_path: &std::path::Path,
         caption: Option<&str>,
-    ) -> Result<()> {
-        self.uploaded.lock().unwrap().push((
-            target_chat_id,
-            local_path.into(),
-            caption.map(String::from),
-        ));
-        Ok(())
+    ) -> Result<i64> {
+        let outcome = self.upload_script.lock().unwrap().pop_front();
+        match outcome {
+            Some(UploadOutcome::FloodWait { seconds }) => {
+                anyhow::bail!("FLOOD_WAIT_{seconds}");
+            }
+            Some(UploadOutcome::Permanent(msg)) => {
+                anyhow::bail!("permanent upload error: {msg}");
+            }
+            Some(UploadOutcome::Ok(id)) => {
+                self.uploaded.lock().unwrap().push((
+                    target_chat_id,
+                    local_path.into(),
+                    caption.map(String::from),
+                    id,
+                ));
+                Ok(id)
+            }
+            None => {
+                let id = self.next_msg_id.fetch_add(1, Ordering::SeqCst);
+                self.uploaded.lock().unwrap().push((
+                    target_chat_id,
+                    local_path.into(),
+                    caption.map(String::from),
+                    id,
+                ));
+                Ok(id)
+            }
+        }
     }
 }

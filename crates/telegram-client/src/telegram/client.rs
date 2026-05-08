@@ -238,10 +238,7 @@ impl TelegramClient for GrammersClient {
             match iter.next().await {
                 Ok(Some(chunk)) => Some((Ok(Bytes::from(chunk)), iter)),
                 Ok(None) => None,
-                Err(e) => Some((
-                    Err(anyhow::anyhow!("grammers iter_download: {e}")),
-                    iter,
-                )),
+                Err(e) => Some((Err(anyhow::anyhow!("grammers iter_download: {e}")), iter)),
             }
         });
 
@@ -250,11 +247,9 @@ impl TelegramClient for GrammersClient {
         Ok(rx)
     }
 
-    async fn upload_file(&self, chat: i64, path: &Path, caption: Option<&str>) -> Result<()> {
+    async fn upload_file(&self, chat: i64, path: &Path, caption: Option<&str>) -> Result<i64> {
         let target = self.find_chat(chat).await?;
-        let mut file = tokio::fs::File::open(path)
-            .await
-            .context("open upload")?;
+        let mut file = tokio::fs::File::open(path).await.context("open upload")?;
         let size = file.metadata().await.context("upload metadata")?.len() as usize;
         let name = path
             .file_name()
@@ -270,11 +265,13 @@ impl TelegramClient for GrammersClient {
         // `InputMessage::default().file(...)` would leave the text empty and
         // there's no public setter post-construction.
         let input_msg = grammers_client::InputMessage::text(caption.unwrap_or("")).file(uploaded);
-        self.client
+        let sent = self
+            .client
             .send_message(&target, input_msg)
             .await
             .context("send_message")?;
-        Ok(())
+        // `Message::id()` returns i32 in grammers 0.7 — widen losslessly to i64.
+        Ok(sent.id() as i64)
     }
 }
 
@@ -302,8 +299,6 @@ fn doc_meta(media: &Media) -> Result<(String, u64, Option<String>)> {
             d.size().max(0) as u64,
             d.mime_type().map(|s| s.to_string()),
         )),
-        other => Err(anyhow!(
-            "unsupported media kind for extraction: {other:?}"
-        )),
+        other => Err(anyhow!("unsupported media kind for extraction: {other:?}")),
     }
 }

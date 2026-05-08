@@ -91,10 +91,11 @@ pub trait TelegramClient: Send + Sync {
     ) -> Result<tokio::sync::mpsc::Receiver<Result<Bytes>>>;
 
     /// Upload a local file to `target_chat_id` with an optional caption.
+    /// Returns the Telegram output message id assigned by the server.
     async fn upload_file(
         &self,
         target_chat_id: i64,
         local_path: &std::path::Path,
         caption: Option<&str>,
-    ) -> Result<()>;
+    ) -> Result<i64>;
 }
