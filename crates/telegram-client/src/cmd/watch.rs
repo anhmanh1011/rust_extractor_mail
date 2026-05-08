@@ -34,16 +34,14 @@ pub struct WatchArgs {
     pub confirm_public: bool,
 }
 
-/// Top-level entry point. Constructs a real
-/// [`GrammersClient`](crate::telegram::client::GrammersClient), opens the
-/// state [`Store`], and delegates to [`run_with_store_and_client`].
-///
-/// `main.rs` calls this only when it has not already opened a `Store` —
-/// the binary path actually goes through
-/// [`run_with_store_and_client`] directly so the Store opened at startup
-/// (which performs `reset_in_flight`) is reused. This entry point exists
-/// to keep the trait/clap dispatch contract uniform with sibling
-/// subcommands.
+/// Stand-alone entry point used by callers that don't already hold a
+/// [`Store`]. The production binary path in `main.rs` does **not** go
+/// through this function — `main.rs` opens the `Store` once at startup,
+/// runs `reset_in_flight`, and dispatches directly into
+/// [`run_with_store_and_client`]. This wrapper is kept for parity with
+/// sibling subcommands' `run`/`run_with_store_and_client` pair and for
+/// future callers (e.g. embedding tests). It opens its own `Store` and
+/// performs `reset_in_flight` so it is safe to call standalone.
 pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &WatchArgs) -> Result<()> {
     let client = crate::telegram::client::GrammersClient::connect(
         secrets.api_id,
@@ -55,6 +53,9 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &WatchArgs) -> Result
     let store_path = std::path::Path::new(&cfg.pipeline.work_dir).join("state.db");
     let store = Store::open(&store_path)
         .with_context(|| format!("open store {}", store_path.display()))?;
+    store
+        .reset_in_flight()
+        .context("reset_in_flight on standalone watch::run")?;
     run_with_store_and_client(cfg, args, &client, &store).await
 }
 
