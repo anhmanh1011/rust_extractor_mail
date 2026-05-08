@@ -15,7 +15,11 @@ use std::path::Path;
 use tracing::field::{Field, Visit};
 
 /// Drop-guard for the optional non-blocking file appender worker.
-pub struct LogGuard(#[allow(dead_code)] pub Option<tracing_appender::non_blocking::WorkerGuard>);
+///
+/// The inner field is intentionally private — callers only need to keep the
+/// guard alive (held in a `_guard` binding in `main`); inspecting it is not
+/// part of the API.
+pub struct LogGuard(#[allow(dead_code)] Option<tracing_appender::non_blocking::WorkerGuard>);
 
 /// Field-formatter that redacts values for secret-named keys.
 /// Use via `tracing_subscriber::fmt::layer().fmt_fields(SecretScrubLayer::new())`.
@@ -148,9 +152,20 @@ pub fn init(level: &str, format: &str, file: Option<&Path>, rotation: &str) -> L
     };
 
     // Compose: Registry -> file_layer (if any) -> env_filter -> console_layer.
-    // The boxed file layer is parameterised over `Registry`, so it must be
-    // attached *before* any other typed layer to satisfy `Layer<Registry>`.
-    // `Option<L>: Layer<S>` when `L: Layer<S>`, so `None` becomes a no-op.
+    //
+    // Two separate concerns dictate the order:
+    //
+    // 1. Type system. The boxed file layer is `dyn Layer<Registry>`, which
+    //    only satisfies `Layer<Registry>` — not `Layer<Layered<…>>`. It must
+    //    be attached *before* any other typed layer. `Option<L>: Layer<S>`
+    //    when `L: Layer<S>`, so `None` becomes a no-op.
+    //
+    // 2. Filtering. `EnvFilter` added via `.with(...)` vetoes events for the
+    //    ENTIRE registry regardless of its position in the chain, because
+    //    `Layered::enabled` combines layer verdicts with `&&` and
+    //    `register_callsite` aggregates `Interest`. So putting `env_filter`
+    //    *between* `file_layer` and `console_layer` still filters both —
+    //    the file layer is not "above" the filter in any operational sense.
     tracing_subscriber::registry()
         .with(file_layer)
         .with(env_filter)
