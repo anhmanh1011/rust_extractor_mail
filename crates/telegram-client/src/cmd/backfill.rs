@@ -21,8 +21,8 @@ pub struct BackfillArgs {
     /// Chat reference: `"@username"`, a numeric chat id like
     /// `"-1001234567890"`, or a bare username (without `@`). Numeric strings
     /// parse as `i64` chat ids; everything else is resolved via
-    /// `TelegramClient::resolve_chat`.
-    #[arg(long)]
+    /// `TelegramClient::resolve_chat`. Positional per spec §8 line 562
+    /// (`<chat>` notation): `tg-extract backfill @dump --since … --limit …`.
     pub chat: String,
 
     /// RFC-3339 UTC cutoff. The cutoff is **exclusive**: a message dated at
