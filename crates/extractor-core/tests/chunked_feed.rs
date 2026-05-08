@@ -27,7 +27,7 @@ fn lines_strategy() -> impl Strategy<Value = Vec<u8>> {
 }
 
 fn split_at_indices(buf: &[u8], indices: &[usize]) -> Vec<Vec<u8>> {
-    let mut sorted: Vec<usize> = indices.iter().copied().collect();
+    let mut sorted: Vec<usize> = indices.to_vec();
     sorted.sort_unstable();
     sorted.dedup();
     sorted.retain(|&i| i <= buf.len());
