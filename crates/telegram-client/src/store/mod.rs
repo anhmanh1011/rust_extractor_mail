@@ -399,3 +399,73 @@ impl Store {
         Ok(())
     }
 }
+
+/// A row in `failed_uploads` — an output file whose final upload to Telegram
+/// failed and is queued for `cmd::retry-uploads`.
+#[derive(Debug, Clone)]
+pub struct FailedUpload {
+    /// SHA-256 of the source file (FK → `files.sha256`).
+    pub sha256:          String,
+    /// Local path to the prepared output file ready for re-upload.
+    pub output_path:     std::path::PathBuf,
+    /// Most recent error message from the failed upload attempt.
+    pub error:           String,
+    /// Total number of upload attempts so far (incremented on each re-enqueue).
+    pub attempts:        u32,
+    /// Unix-seconds timestamp of the most recent failed attempt.
+    pub last_attempt_at: i64,
+}
+
+impl Store {
+    /// Record a failed upload by sha256. Re-calling for the same sha bumps
+    /// `attempts` and replaces `output_path`/`error`/`last_attempt_at` with
+    /// the latest values.
+    pub fn enqueue_failed_upload(&self, sha: &str, p: &Path, err: &str) -> Result<()> {
+        let now = now_secs();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO failed_uploads(sha256, output_path, error, attempts, last_attempt_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(sha256) DO UPDATE SET
+                 output_path     = excluded.output_path,
+                 error           = excluded.error,
+                 attempts        = failed_uploads.attempts + 1,
+                 last_attempt_at = excluded.last_attempt_at",
+            rusqlite::params![sha, p.to_string_lossy(), err, now],
+        )
+        .with_context(|| format!("UPSERT failed_uploads sha256={sha}"))?;
+        Ok(())
+    }
+
+    /// Return all queued failed uploads ordered by oldest `last_attempt_at` first.
+    pub fn pending_failed_uploads(&self) -> Result<Vec<FailedUpload>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT sha256, output_path, error, attempts, last_attempt_at
+               FROM failed_uploads ORDER BY last_attempt_at ASC",
+        ).context("prepare pending_failed_uploads")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(FailedUpload {
+                sha256:          r.get(0)?,
+                output_path:     std::path::PathBuf::from(r.get::<_, String>(1)?),
+                error:           r.get(2)?,
+                attempts:        u32::try_from(r.get::<_, i64>(3)?).unwrap_or(0),
+                last_attempt_at: r.get(4)?,
+            })
+        }).context("query pending_failed_uploads")?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+
+    /// Drop a row from `failed_uploads` after a successful retry.
+    pub fn clear_failed_upload(&self, sha: &str) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "DELETE FROM failed_uploads WHERE sha256=?1",
+            rusqlite::params![sha],
+        )
+        .with_context(|| format!("DELETE failed_uploads sha256={sha}"))?;
+        Ok(())
+    }
+}
