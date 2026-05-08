@@ -1,8 +1,12 @@
-//! `tg-extract fetch` subcommand (spec §4.1, §8).
+//! `tg-extract fetch` subcommand (spec §4.1, §6.3, §6.4, §8, §11.2).
 //!
 //! Entry points:
 //! - [`run`]: real binary path -- builds a `GrammersClient` then delegates.
-//! - [`run_with_client`]: generic over [`TelegramClient`] -- used by tests.
+//! - [`run_with_client`]: generic over [`TelegramClient`] -- used by tests
+//!   without a `Store` (back-compat with Phase 4-6 callers).
+//! - [`run_with_store_and_client`]: generic over [`TelegramClient`] with an
+//!   optional [`Store`](crate::store::Store) for sha256 dedup + lifecycle
+//!   stamping (Phase 7).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,6 +15,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use clap::Args;
 use extractor_core::Matcher;
+use sha2::{Digest, Sha256};
 
 use crate::config::{AppConfig, ExtractMode, Secrets};
 use crate::output::{join_safe, sanitize};
@@ -70,26 +75,46 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &FetchArgs) -> Result
     run_with_client(cfg, args, &client).await
 }
 
-/// Generic fetch implementation, usable from both the binary and tests.
+/// Generic fetch implementation without store wiring. Equivalent to calling
+/// [`run_with_store_and_client`] with `store = None`. Preserved for back-compat
+/// with Phase 4-6 callers (mostly tests); the binary path always wires a Store.
+pub async fn run_with_client<C: TelegramClient>(
+    cfg: &AppConfig,
+    args: &FetchArgs,
+    client: &C,
+) -> Result<()> {
+    run_with_store_and_client(cfg, args, client, None).await
+}
+
+/// Generic fetch implementation with optional [`Store`](crate::store::Store)
+/// wiring (Phase 7). Usable from both the binary and tests.
 ///
 /// Flow:
 /// 1. Warm the client (no-op for `MockClient`; loads dialog cache for real client).
 /// 2. Resolve `--link` or `(--chat, --msg-id)` to `(chat_id, msg_id)`.
 /// 3. Fetch [`MessageInfo`] for the target message.
 /// 4. Open a `download_stream` and peek the first chunk for format detection.
-/// 5. Route the stream through `stream_extract` for `.txt`/`.gz`, or
-///    `disk_extract` for `.zip` (disk-spill path).
-/// 6. Write matched lines to `<output_dir>/<chat_id>/<msg_id>_<sanitized_name>.out`.
-/// 7. Optionally upload that output to `cfg.telegram.output.{chat,chat_id}`
+/// 5. Tee the chunk stream: one branch feeds the extractor, the other a
+///    Sha256 hasher task. The final hex sha keys the `files` row.
+/// 6. Route the stream through `stream_extract` for `.txt`/`.gz`, or delegate
+///    to [`run_zip_path`] for `.zip` (disk-spill path).
+/// 7. Write matched lines to `<output_dir>/<chat_id>/<msg_id>_<sanitized_name>.out`.
+/// 8. If a `store` is provided: `try_enqueue` short-circuits on
+///    `AlreadyDone` (delete out_path; no upload), proceeds on
+///    `InProgress`/`New`, and stamps `mark_downloading` →
+///    `mark_downloaded` → `mark_extracted` → `mark_uploaded`.
+/// 9. Optionally upload that output to `cfg.telegram.output.{chat,chat_id}`
 ///    via [`crate::pipeline::upload::run`] (skipped when `args.no_upload`
 ///    is set or no output chat is configured). Public-chat targets require
-///    `--confirm-public` per spec §11.2.
+///    `--confirm-public` per spec §11.2. Failed uploads are persisted via
+///    [`crate::store::Store::enqueue_failed_upload`].
 ///
 /// [`MessageInfo`]: crate::telegram::MessageInfo
-pub async fn run_with_client<C: TelegramClient>(
+pub async fn run_with_store_and_client<C: TelegramClient>(
     cfg: &AppConfig,
     args: &FetchArgs,
     client: &C,
+    store: Option<&crate::store::Store>,
 ) -> Result<()> {
     client
         .connect_and_warm()
@@ -111,30 +136,69 @@ pub async fn run_with_client<C: TelegramClient>(
         .with_context(|| format!("join_safe under {}", chat_dir.display()))?;
 
     // Open download stream and peek the first chunk for magic-byte detection.
-    let mut chunks = client
+    let mut chunks_in = client
         .download_stream(chat_id, msg_id)
         .await
         .context("download_stream")?;
-    let first_chunk: Bytes = match chunks.recv().await {
+    let first_chunk: Bytes = match chunks_in.recv().await {
         Some(Ok(b)) => b,
         Some(Err(e)) => return Err(e.context("first chunk from download_stream")),
         None => Bytes::new(),
     };
     let format = detect_format(&info.file_name, &first_chunk);
-
-    // Bridge the upstream Receiver<Result<Bytes>> to a plain Receiver<Bytes>,
-    // re-prepending the already-peeked first chunk so the extractor sees the
-    // full stream.
-    let cap = cfg.pipeline.intra_file_channel_capacity;
-    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(cap);
-    tokio::spawn(async move {
-        if !first_chunk.is_empty() && tx.send(first_chunk).await.is_err() {
-            return;
+    let is_gzip = match format {
+        Format::Txt => false,
+        Format::Gz => true,
+        Format::Zip => {
+            return run_zip_path(
+                cfg,
+                args,
+                client,
+                store,
+                chat_id,
+                msg_id,
+                info,
+                out_path,
+                first_chunk,
+                chunks_in,
+            )
+            .await
         }
-        while let Some(item) = chunks.recv().await {
+        Format::Unknown => bail!(
+            "unknown format for {} (extension + magic both inconclusive)",
+            info.file_name
+        ),
+    };
+
+    // Tee: chunks fan out to (a) the extractor input pipe and (b) a Sha256
+    // hashing task. Both branches see the already-peeked first chunk.
+    let cap = cfg.pipeline.intra_file_channel_capacity;
+    let (pipe_tx, pipe_rx) = tokio::sync::mpsc::channel::<Bytes>(cap);
+    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<Bytes>(cap);
+
+    let hasher_handle = tokio::spawn(async move {
+        let mut h = Sha256::new();
+        while let Some(b) = hash_rx.recv().await {
+            h.update(&b);
+        }
+        hex::encode(h.finalize())
+    });
+
+    let first = first_chunk.clone();
+    let pipe_tx_for_first = pipe_tx.clone();
+    let hash_tx_for_first = hash_tx.clone();
+    tokio::spawn(async move {
+        if !first.is_empty() {
+            let _ = pipe_tx_for_first.send(first.clone()).await;
+            let _ = hash_tx_for_first.send(first).await;
+        }
+        while let Some(item) = chunks_in.recv().await {
             match item {
                 Ok(b) => {
-                    if tx.send(b).await.is_err() {
+                    if pipe_tx.send(b.clone()).await.is_err() {
+                        return;
+                    }
+                    if hash_tx.send(b).await.is_err() {
                         return;
                     }
                 }
@@ -144,141 +208,187 @@ pub async fn run_with_client<C: TelegramClient>(
         }
     });
 
+    // Run the extractor.
     let matcher = Arc::new(
         Matcher::new(&cfg.extract.key, mode_for_extract(cfg.extract.mode))
             .context("Matcher::new")?,
     );
+    let writer = std::fs::File::create(&out_path)
+        .with_context(|| format!("create {}", out_path.display()))?;
+    let (file, stats) = stream_extract(
+        pipe_rx,
+        matcher,
+        cfg.pipeline.max_line_bytes,
+        writer,
+        is_gzip,
+    )
+    .await
+    .with_context(|| format!("stream_extract for {}", out_path.display()))?;
+    drop(file);
 
-    let stats: CaptionStats = match format {
-        Format::Txt => run_stream_path(cfg, &info, &out_path, rx, matcher, false).await?,
-        Format::Gz => run_stream_path(cfg, &info, &out_path, rx, matcher, true).await?,
-        Format::Zip => run_disk_path(cfg, &info, &out_path, rx, matcher).await?,
-        Format::Unknown => bail!(
-            "unknown format for {} (extension + magic both inconclusive)",
-            info.file_name
-        ),
+    tracing::info!(
+        chat_id = info.chat_id,
+        msg_id = info.msg_id,
+        file_name = %info.file_name,
+        out = %out_path.display(),
+        lines_scanned = stats.lines_scanned,
+        lines_matched = stats.lines_matched,
+        bytes_scanned = stats.bytes_scanned,
+        "fetch complete (stream)",
+    );
+
+    let cap_stats = CaptionStats {
+        lines_scanned: stats.lines_scanned,
+        lines_matched: stats.lines_matched,
     };
+
+    // Finalize hash and dedup.
+    let sha = hasher_handle.await.context("hasher join")?;
+    if let Some(s) = store {
+        let meta = crate::store::FileMeta {
+            sha256: sha.clone(),
+            source_chat_id: chat_id,
+            source_msg_id: msg_id,
+            original_name: info.file_name.clone(),
+            size_bytes: info.size,
+            format: format_label(&format),
+            matcher_key: cfg.extract.key.clone(),
+            matcher_mode: match cfg.extract.mode {
+                ExtractMode::Plain => "plain".into(),
+                ExtractMode::Url => "url".into(),
+            },
+        };
+        match s.try_enqueue(&meta).context("try_enqueue")? {
+            crate::store::EnqueueResult::AlreadyDone => {
+                tracing::info!(sha256 = %sha, "fetch: dedup hit (file already done)");
+                let _ = std::fs::remove_file(&out_path);
+                return Ok(());
+            }
+            crate::store::EnqueueResult::InProgress(state) => {
+                tracing::warn!(
+                    sha256 = %sha,
+                    state = %state,
+                    "fetch: another run is processing this file; proceeding (last-writer wins)",
+                );
+            }
+            crate::store::EnqueueResult::New => {}
+        }
+        s.mark_downloading(&sha)?;
+        s.mark_downloaded(&sha)?;
+        s.mark_extracted(&sha, stats.lines_scanned, stats.lines_matched, &out_path)?;
+    }
 
     // Phase 6: optional upload to telegram.output.chat. Order matters:
     // `resolve_output_chat` runs the public-chat gate FIRST, then resolves,
     // so users get a clear error before any network resolve is attempted.
     if !args.no_upload {
         if let Some(target_chat_id) = resolve_output_chat(cfg, args, client).await? {
-            let caption_data = crate::upload::caption::CaptionData {
-                original_name: info.file_name.clone(),
-                source_chat_id: chat_id,
-                source_msg_id: msg_id,
-                matcher_key: cfg.extract.key.clone(),
-                matcher_mode: match cfg.extract.mode {
-                    ExtractMode::Plain => "plain".into(),
-                    ExtractMode::Url => "url".into(),
-                },
-                size_bytes: info.size,
-                lines_scanned: stats.lines_scanned,
-                lines_matched: stats.lines_matched,
-            };
-
-            let job = crate::pipeline::upload::UploadJob {
-                // sha256 stays empty until Phase 7 wires content hashing
-                // through `cmd::fetch`. Downstream observers must tolerate.
-                sha256: String::new(),
-                output_path: out_path.clone(),
-                caption: caption_data,
-            };
-            // `cmd::fetch` is a one-shot: a single source message produces a
-            // single UploadJob, so a 1-element channel is correct here.
-            // Phase 8 (`cmd::watch`) and Phase 9 (`cmd::backfill`) will instead
-            // size these channels from `cfg.pipeline.upload_channel_capacity`
-            // (and `inter_file_channel_capacity` for the per-file fan-in).
-            let (jt, jr) = tokio::sync::mpsc::channel(1);
-            let (ot, mut or) = tokio::sync::mpsc::channel(1);
-            let upload_cfg = crate::pipeline::upload::UploadRunConfig {
+            run_single_upload(
+                client,
+                cfg,
+                &out_path,
+                &info,
+                &sha,
+                chat_id,
+                msg_id,
+                cap_stats,
                 target_chat_id,
-                upload_max_size_bytes: cfg.pipeline.upload_max_size_bytes,
-                upload_rate_seconds: cfg.pipeline.upload_rate_seconds,
-                retry: crate::pipeline::upload::RetryPolicy::default(),
-            };
-            jt.send(job).await.context("send upload job")?;
-            drop(jt);
-            crate::pipeline::upload::run(client, jr, ot, &upload_cfg, |_j, e| {
-                tracing::error!(
-                    error = %format!("{e:#}"),
-                    "fetch: upload failed (Phase 7 will persist this to failed_uploads)",
-                );
-            })
-            .await
-            .context("upload run")?;
-            while let Some(o) = or.recv().await {
-                if let crate::pipeline::upload::UploadOutcome::Done {
-                    output_msg_ids, ..
-                } = o
-                {
-                    tracing::info!(?output_msg_ids, "fetch upload complete");
-                }
-            }
+                store,
+            )
+            .await?;
         }
     }
+    // `--no-upload` deliberately leaves the row at status='uploading'
+    // (the state mark_extracted transitions to). Marking it 'done' with
+    // `output_msg_id=0` would (a) collide with any real future msg_id of 0
+    // and (b) cause the next plain `fetch` of the same source to
+    // short-circuit on AlreadyDone, even though the file was never
+    // actually uploaded. By staying at 'uploading', a later `fetch`
+    // (without --no-upload) lands on `InProgress(uploading)` above and
+    // proceeds with the upload — which is the desired behavior for a
+    // debug/audit-only invocation. Subsequent process restarts also pick
+    // it up: `reset_in_flight` (Task 7.3) clears transient states back to
+    // 'queued', so a re-run reproduces the upload from scratch.
 
     Ok(())
 }
 
-/// Stream-extract path: in-memory pipeline through `stream_extract`.
-/// Used for `.txt` (plain) and `.gz` (gzip) sources.
-async fn run_stream_path(
+/// Zip-archive fetch path. Mirrors the txt/gz path but routes the chunk
+/// stream into `disk_extract` (which spills the archive to a tempfile and
+/// iterates its entries). The same tee pattern feeds a Sha256 hasher.
+///
+/// The shape is duplicated rather than abstracted because the post-extract
+/// shape is identical to txt/gz; collapsing them would force a sum type
+/// over `stream_extract` / `disk_extract` stats that adds more noise than
+/// it removes.
+#[allow(clippy::too_many_arguments)]
+async fn run_zip_path<C: TelegramClient>(
     cfg: &AppConfig,
-    info: &MessageInfo,
-    out_path: &Path,
-    rx: tokio::sync::mpsc::Receiver<Bytes>,
-    matcher: Arc<Matcher>,
-    is_gzip: bool,
-) -> Result<CaptionStats> {
-    let writer = std::fs::File::create(out_path)
-        .with_context(|| format!("create {}", out_path.display()))?;
-    let (_file, stats) = stream_extract(rx, matcher, cfg.pipeline.max_line_bytes, writer, is_gzip)
-        .await
-        .with_context(|| format!("stream_extract for {}", out_path.display()))?;
-    // _file (the File handle) is dropped here, flushing and closing the fd.
+    args: &FetchArgs,
+    client: &C,
+    store: Option<&crate::store::Store>,
+    chat_id: i64,
+    msg_id: i32,
+    info: MessageInfo,
+    out_path: std::path::PathBuf,
+    first_chunk: Bytes,
+    mut chunks_in: tokio::sync::mpsc::Receiver<Result<Bytes>>,
+) -> Result<()> {
+    let cap = cfg.pipeline.intra_file_channel_capacity;
+    let (pipe_tx, pipe_rx) = tokio::sync::mpsc::channel::<Bytes>(cap);
+    let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<Bytes>(cap);
 
-    tracing::info!(
-        chat_id   = info.chat_id,
-        msg_id    = info.msg_id,
-        file_name = %info.file_name,
-        out       = %out_path.display(),
-        lines_scanned = stats.lines_scanned,
-        lines_matched = stats.lines_matched,
-        bytes_scanned = stats.bytes_scanned,
-        "fetch complete (stream)",
+    let hasher_handle = tokio::spawn(async move {
+        let mut h = Sha256::new();
+        while let Some(b) = hash_rx.recv().await {
+            h.update(&b);
+        }
+        hex::encode(h.finalize())
+    });
+
+    let first = first_chunk.clone();
+    let pipe_tx_for_first = pipe_tx.clone();
+    let hash_tx_for_first = hash_tx.clone();
+    tokio::spawn(async move {
+        if !first.is_empty() {
+            let _ = pipe_tx_for_first.send(first.clone()).await;
+            let _ = hash_tx_for_first.send(first).await;
+        }
+        while let Some(item) = chunks_in.recv().await {
+            match item {
+                Ok(b) => {
+                    if pipe_tx.send(b.clone()).await.is_err() {
+                        return;
+                    }
+                    if hash_tx.send(b).await.is_err() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
+
+    // Run the zip-aware extractor.
+    let matcher = Arc::new(
+        Matcher::new(&cfg.extract.key, mode_for_extract(cfg.extract.mode))
+            .context("Matcher::new")?,
     );
-    Ok(CaptionStats {
-        lines_scanned: stats.lines_scanned,
-        lines_matched: stats.lines_matched,
-    })
-}
-
-/// Disk-spill path: spool the archive to a tempfile, then iterate its entries
-/// through `disk_extract`. Used for `.zip` sources.
-async fn run_disk_path(
-    cfg: &AppConfig,
-    info: &MessageInfo,
-    out_path: &Path,
-    rx: tokio::sync::mpsc::Receiver<Bytes>,
-    matcher: Arc<Matcher>,
-) -> Result<CaptionStats> {
     let stats = disk_extract(
-        rx,
+        pipe_rx,
         matcher,
         cfg.pipeline.max_line_bytes,
         cfg.pipeline.max_uncompressed_bytes,
-        out_path,
+        &out_path,
     )
     .await
     .with_context(|| format!("disk_extract for {}", out_path.display()))?;
 
     tracing::info!(
-        chat_id   = info.chat_id,
-        msg_id    = info.msg_id,
+        chat_id = info.chat_id,
+        msg_id = info.msg_id,
         file_name = %info.file_name,
-        out       = %out_path.display(),
+        out = %out_path.display(),
         lines_scanned = stats.lines_scanned,
         lines_matched = stats.lines_matched,
         bytes_scanned = stats.bytes_scanned,
@@ -286,10 +396,181 @@ async fn run_disk_path(
         entries_skipped = stats.entries_skipped,
         "fetch complete (disk-spill)",
     );
-    Ok(CaptionStats {
+
+    // Finalize hash and dedup. Same shape as txt/gz.
+    let sha = hasher_handle.await.context("hasher join")?;
+    if let Some(s) = store {
+        let meta = crate::store::FileMeta {
+            sha256: sha.clone(),
+            source_chat_id: chat_id,
+            source_msg_id: msg_id,
+            original_name: info.file_name.clone(),
+            size_bytes: info.size,
+            format: "zip".into(),
+            matcher_key: cfg.extract.key.clone(),
+            matcher_mode: match cfg.extract.mode {
+                ExtractMode::Plain => "plain".into(),
+                ExtractMode::Url => "url".into(),
+            },
+        };
+        match s.try_enqueue(&meta).context("try_enqueue")? {
+            crate::store::EnqueueResult::AlreadyDone => {
+                tracing::info!(sha256 = %sha, "fetch: dedup hit (file already done)");
+                let _ = std::fs::remove_file(&out_path);
+                return Ok(());
+            }
+            crate::store::EnqueueResult::InProgress(state) => {
+                tracing::warn!(
+                    sha256 = %sha,
+                    state = %state,
+                    "fetch: another run is processing this file; proceeding (last-writer wins)",
+                );
+            }
+            crate::store::EnqueueResult::New => {}
+        }
+        s.mark_downloading(&sha)?;
+        s.mark_downloaded(&sha)?;
+        s.mark_extracted(&sha, stats.lines_scanned, stats.lines_matched, &out_path)?;
+    }
+
+    if !args.no_upload {
+        if let Some(target_chat_id) = resolve_output_chat(cfg, args, client).await? {
+            // disk_extract returns DiskExtractStats; the upload caption only
+            // consumes lines_scanned + lines_matched, so adapt to CaptionStats.
+            let cap_stats = CaptionStats {
+                lines_scanned: stats.lines_scanned,
+                lines_matched: stats.lines_matched,
+            };
+            run_single_upload(
+                client,
+                cfg,
+                &out_path,
+                &info,
+                &sha,
+                chat_id,
+                msg_id,
+                cap_stats,
+                target_chat_id,
+                store,
+            )
+            .await?;
+        }
+    }
+    // See `run_with_store_and_client` for the `--no-upload` invariant comment.
+    Ok(())
+}
+
+/// Drive a single output file through the upload pipeline and stamp the
+/// resulting message id (or failed-upload row) onto `store`.
+///
+/// `pipeline::upload::run` requires `F: FnMut(...) + Send + 'static`, so the
+/// failure callback cannot borrow `&Store`. We route failures through a
+/// `std::sync::mpsc::channel` and persist them serially after `run` returns
+/// — this is `cmd::fetch` which is one-shot, so we are NOT in any hot path.
+#[allow(clippy::too_many_arguments)]
+async fn run_single_upload<C: TelegramClient>(
+    client: &C,
+    cfg: &AppConfig,
+    out_path: &Path,
+    info: &MessageInfo,
+    sha256: &str,
+    source_chat_id: i64,
+    source_msg_id: i32,
+    stats: CaptionStats,
+    target_chat_id: i64,
+    store: Option<&crate::store::Store>,
+) -> Result<()> {
+    let caption_data = crate::upload::caption::CaptionData {
+        original_name: info.file_name.clone(),
+        source_chat_id,
+        source_msg_id,
+        matcher_key: cfg.extract.key.clone(),
+        matcher_mode: match cfg.extract.mode {
+            ExtractMode::Plain => "plain".into(),
+            ExtractMode::Url => "url".into(),
+        },
+        size_bytes: info.size,
         lines_scanned: stats.lines_scanned,
         lines_matched: stats.lines_matched,
-    })
+    };
+    let job = crate::pipeline::upload::UploadJob {
+        sha256: sha256.to_string(),
+        output_path: out_path.to_path_buf(),
+        caption: caption_data,
+    };
+    // `cmd::fetch` is a one-shot: a single source message produces a single
+    // UploadJob, so 1-element channels are correct here. Phase 8/9 size
+    // these from `cfg.pipeline.upload_channel_capacity`.
+    let (jt, jr) = tokio::sync::mpsc::channel(1);
+    let (ot, mut or) = tokio::sync::mpsc::channel(1);
+    let upload_cfg = crate::pipeline::upload::UploadRunConfig {
+        target_chat_id,
+        upload_max_size_bytes: cfg.pipeline.upload_max_size_bytes,
+        upload_rate_seconds: cfg.pipeline.upload_rate_seconds,
+        retry: crate::pipeline::upload::RetryPolicy::default(),
+    };
+    jt.send(job).await.context("send upload job")?;
+    drop(jt);
+
+    // Failure callback: route through a sync mpsc since the closure is
+    // `Send + 'static` and cannot borrow `&Store`.
+    let (failed_tx, failed_rx) =
+        std::sync::mpsc::channel::<(crate::pipeline::upload::UploadJob, String)>();
+    let on_failed = move |job: crate::pipeline::upload::UploadJob, err: anyhow::Error| {
+        let _ = failed_tx.send((job, format!("{err:#}")));
+    };
+    crate::pipeline::upload::run(client, jr, ot, &upload_cfg, on_failed)
+        .await
+        .context("upload run")?;
+    while let Some(o) = or.recv().await {
+        if let crate::pipeline::upload::UploadOutcome::Done {
+            sha256: s,
+            output_msg_ids,
+        } = o
+        {
+            if let Some(st) = store {
+                // `files.output_msg_id` is INTEGER (single column). For multi-part
+                // uploads (file > telegram.upload.max_size_bytes), only the FIRST
+                // part's msg_id is recorded — that's the "head" message; subsequent
+                // parts are reachable via Telegram's reply chain or a `Part i/N`
+                // search in the destination chat. We log the full vector for audit.
+                // A schema-level fix (separate `output_message_ids` table) is out of
+                // scope for Phase 7; revisit in Phase 10 (hardening) if needed.
+                let head = output_msg_ids.first().copied().unwrap_or_else(|| {
+                    tracing::error!(
+                        sha256 = %s,
+                        "Done outcome had empty output_msg_ids; recording 0 — investigate upload::run",
+                    );
+                    0
+                });
+                st.mark_uploaded(&s, head)?;
+            }
+            tracing::info!(?output_msg_ids, "fetch upload complete");
+        }
+    }
+    while let Ok((job, err_str)) = failed_rx.try_recv() {
+        if let Some(s) = store {
+            s.enqueue_failed_upload(&job.sha256, &job.output_path, &err_str)
+                .context("enqueue_failed_upload after run")?;
+        } else {
+            tracing::error!(
+                sha256 = %job.sha256,
+                error = %err_str,
+                "upload failed (no Store wired — record dropped)",
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Map a detected [`Format`] to its short tag stored in `files.format`.
+fn format_label(f: &Format) -> String {
+    match f {
+        Format::Txt => "txt".into(),
+        Format::Gz => "gz".into(),
+        Format::Zip => "zip".into(),
+        Format::Unknown => "unknown".into(),
+    }
 }
 
 /// Resolve CLI arguments to a `(chat_id, msg_id)` pair.

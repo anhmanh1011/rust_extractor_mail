@@ -458,3 +458,146 @@ async fn fetch_does_not_gate_numeric_chat_string() {
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0].0, -1001234567890);
 }
+
+// ── Task 7.6: Store wiring + sha256 dedup tests ──────────────────────────────
+
+#[tokio::test]
+async fn fetch_persists_files_row_and_dedupes_on_second_run() {
+    use telegram_client::store::{EnqueueResult, Store};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockClient::new());
+    mock.set_message(
+        42,
+        7,
+        MessageInfo {
+            chat_id: 42,
+            msg_id: 7,
+            file_name: "dump.txt".into(),
+            size: 10,
+            mime: None,
+        },
+    );
+    mock.script_download(
+        42,
+        7,
+        vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
+    );
+    mock.script_upload(vec![telegram_client::telegram::mock::UploadOutcome::Ok(701)]);
+
+    let mut cfg = cfg(tmp.path());
+    cfg.telegram.output.chat_id = Some(-1001234567890);
+
+    let store = Store::open(&tmp.path().join("state.db")).unwrap();
+
+    let args = telegram_client::cmd::fetch::FetchArgs {
+        link: None,
+        chat: Some(42),
+        msg_id: Some(7),
+        no_upload: false,
+        confirm_public: false,
+    };
+    telegram_client::cmd::fetch::run_with_store_and_client(
+        &cfg,
+        &args,
+        mock.as_ref(),
+        Some(&store),
+    )
+    .await
+    .unwrap();
+
+    // Second run: same source, fresh download; second mock script must be primed,
+    // but try_enqueue should short-circuit before re-uploading.
+    mock.script_download(
+        42,
+        7,
+        vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
+    );
+    let result = telegram_client::cmd::fetch::run_with_store_and_client(
+        &cfg,
+        &args,
+        mock.as_ref(),
+        Some(&store),
+    )
+    .await;
+
+    assert!(result.is_ok(), "second run: {:?}", result);
+    let uploads = mock.uploaded.lock().unwrap();
+    assert_eq!(uploads.len(), 1, "second run must NOT re-upload");
+
+    // Validate one row, status=done.
+    let conn = store.lock();
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+    let st: String = conn
+        .query_row("SELECT status FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(st, "done");
+    let _ = EnqueueResult::AlreadyDone; // sentinel to keep the import alive
+}
+
+#[tokio::test]
+async fn fetch_no_upload_does_not_pollute_dedup_state() {
+    use telegram_client::store::Store;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockClient::new());
+    mock.set_message(
+        42,
+        7,
+        MessageInfo {
+            chat_id: 42,
+            msg_id: 7,
+            file_name: "dump.txt".into(),
+            size: 10,
+            mime: None,
+        },
+    );
+    mock.script_download(
+        42,
+        7,
+        vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
+    );
+
+    let mut cfg = cfg(tmp.path());
+    cfg.telegram.output.chat_id = Some(-1001234567890);
+
+    let store = Store::open(&tmp.path().join("state.db")).unwrap();
+
+    let args = telegram_client::cmd::fetch::FetchArgs {
+        link: None,
+        chat: Some(42),
+        msg_id: Some(7),
+        no_upload: true,
+        confirm_public: false,
+    };
+    telegram_client::cmd::fetch::run_with_store_and_client(
+        &cfg,
+        &args,
+        mock.as_ref(),
+        Some(&store),
+    )
+    .await
+    .unwrap();
+
+    // The row exists but is NOT 'done' -- no upload happened, so a future
+    // run without --no-upload must be allowed to proceed.
+    let conn = store.lock();
+    let st: String = conn
+        .query_row("SELECT status FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert_ne!(st, "done", "--no-upload must not mark status=done");
+    let omid: Option<i64> = conn
+        .query_row("SELECT output_msg_id FROM files", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        omid.is_none(),
+        "--no-upload must leave output_msg_id NULL (got {omid:?})"
+    );
+
+    // No upload was attempted.
+    let uploads = mock.uploaded.lock().unwrap();
+    assert_eq!(uploads.len(), 0);
+}

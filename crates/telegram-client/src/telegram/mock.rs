@@ -98,6 +98,19 @@ impl MockClient {
         self
     }
 
+    /// Register a message's metadata for `message_info()` lookups.
+    ///
+    /// Mirrors [`Self::with_document`] but takes `&self` so it composes with
+    /// `Arc<MockClient>` (alongside `script_download`/`script_upload`). The
+    /// stored payload bytes are empty — pair with `script_download` to drive
+    /// chunk delivery.
+    pub fn set_message(&self, chat_id: i64, msg_id: i32, info: MessageInfo) {
+        self.messages
+            .lock()
+            .unwrap()
+            .insert((chat_id, msg_id), (info, Vec::new()));
+    }
+
     /// Register a chunk-by-chunk download script for `(chat_id, msg_id)`.
     ///
     /// The script is consumed (drained) on the first `download_stream` call
