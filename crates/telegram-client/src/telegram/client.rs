@@ -204,12 +204,50 @@ impl TelegramClient for GrammersClient {
 
     async fn download_stream(
         &self,
-        _chat_id: i64,
-        _msg_id: i32,
+        chat_id: i64,
+        msg_id: i32,
     ) -> Result<mpsc::Receiver<Result<Bytes>>> {
-        // Phase 4 fills this in: spawn a tokio task that drives grammers'
-        // streaming download API and forwards chunks via mpsc.
-        Err(anyhow!("download_stream: implemented in Phase 4"))
+        use anyhow::Context as _;
+
+        // 1. Resolve message to media reference.
+        let chat = self
+            .find_chat(chat_id)
+            .await
+            .context("resolve chat for download_stream")?;
+        let msg = self
+            .client
+            .get_messages_by_id(&chat, &[msg_id])
+            .await
+            .context("get_messages_by_id")?
+            .into_iter()
+            .flatten()
+            .next()
+            .ok_or_else(|| anyhow!("message {msg_id} not found in chat {chat_id}"))?;
+
+        let media = msg
+            .media()
+            .ok_or_else(|| anyhow!("message {msg_id} has no media"))?;
+
+        // 2. Wrap Media → Downloadable and build the grammers chunk iterator.
+        //    Then convert to a futures::Stream via unfold so pump_chunks can
+        //    drive it without capturing a mutable reference across closure calls.
+        let downloadable = grammers_client::types::Downloadable::Media(media);
+        let dl = self.client.iter_download(&downloadable);
+
+        let chunk_stream = futures::stream::unfold(dl, |mut iter| async move {
+            match iter.next().await {
+                Ok(Some(chunk)) => Some((Ok(Bytes::from(chunk)), iter)),
+                Ok(None) => None,
+                Err(e) => Some((
+                    Err(anyhow::anyhow!("grammers iter_download: {e}")),
+                    iter,
+                )),
+            }
+        });
+
+        let (tx, rx) = mpsc::channel(crate::telegram::download::INTRA_FILE_CAP);
+        tokio::spawn(crate::telegram::download::pump_chunks(tx, chunk_stream));
+        Ok(rx)
     }
 
     async fn upload_file(&self, chat: i64, path: &Path, caption: Option<&str>) -> Result<()> {
