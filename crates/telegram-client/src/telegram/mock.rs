@@ -4,7 +4,7 @@ use super::*;
 use anyhow::Result;
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tokio::sync::mpsc;
 
@@ -57,8 +57,15 @@ pub struct MockClient {
     /// Per-chat scripted history. `iter_history` reads from here.
     /// Stored newest-first (high msg_id → low msg_id).
     pub history: Mutex<HashMap<i64, Vec<MessageInfo>>>,
-    /// Scripted updates queue (FIFO across all chats; consumer filters).
-    pub updates: Mutex<Vec<MessageInfo>>,
+    /// Scripted update batches (FIFO across all chats; consumer filters).
+    /// Each call to `subscribe_updates` consumes the FRONT batch — that
+    /// models a real Telegram stream which closes after each "burst" so
+    /// the auto-reconnect loop can be exercised by scripting more than one
+    /// batch.
+    pub update_batches: Mutex<Vec<Vec<MessageInfo>>>,
+    /// Counts calls to `subscribe_updates`. Tests assert this directly via
+    /// [`MockClient::subscribe_calls`] to pin reconnect behavior.
+    subscribe_call_count: AtomicUsize,
 }
 
 impl MockClient {
@@ -73,7 +80,8 @@ impl MockClient {
             next_msg_id: AtomicI64::new(1_000),
             upload_script: Mutex::new(std::collections::VecDeque::new()),
             history: Mutex::new(HashMap::new()),
-            updates: Mutex::new(Vec::new()),
+            update_batches: Mutex::new(Vec::new()),
+            subscribe_call_count: AtomicUsize::new(0),
         }
     }
 
@@ -87,11 +95,28 @@ impl MockClient {
         self.history.lock().unwrap().insert(chat_id, page);
     }
 
-    /// Record live updates that `subscribe_updates` will deliver in order.
-    /// Append-only: each call extends the existing queue. Consumed (drained)
-    /// by the first `subscribe_updates` call after the script is staged.
+    /// Record live updates that `subscribe_updates` will deliver as a single
+    /// batch. Each call APPENDS one batch — the next `subscribe_updates`
+    /// call drains the front batch and closes the channel, modelling a
+    /// real Telegram stream that closes after a burst so the auto-reconnect
+    /// loop can be exercised. Backwards-compatible thin wrapper over
+    /// [`Self::script_updates_batches`].
     pub fn script_updates(&self, evts: Vec<MessageInfo>) {
-        self.updates.lock().unwrap().extend(evts);
+        self.update_batches.lock().unwrap().push(evts);
+    }
+
+    /// Replace the queued update batches with the supplied list. Each batch
+    /// is delivered by exactly one `subscribe_updates` call; the receiver
+    /// closes after the batch's last item, so the consumer must
+    /// re-subscribe to consume the next batch. Used to pin reconnect
+    /// behavior in [`crate::cmd::watch::subscribe_with_reconnect`].
+    pub fn script_updates_batches(&self, batches: Vec<Vec<MessageInfo>>) {
+        *self.update_batches.lock().unwrap() = batches;
+    }
+
+    /// Number of times `subscribe_updates` has been called on this mock.
+    pub fn subscribe_calls(&self) -> usize {
+        self.subscribe_call_count.load(Ordering::Relaxed)
     }
 
     /// Push a sequence of upload outcomes consumed FIFO by `upload_file`.
@@ -315,8 +340,22 @@ impl TelegramClient for MockClient {
         &self,
         chat_ids: &[i64],
     ) -> Result<mpsc::Receiver<MessageInfo>> {
+        // Count this subscription attempt so reconnect tests can pin the
+        // expected number of re-subscribes.
+        self.subscribe_call_count.fetch_add(1, Ordering::Relaxed);
+
         let want: std::collections::HashSet<i64> = chat_ids.iter().copied().collect();
-        let queued = std::mem::take(&mut *self.updates.lock().unwrap());
+        // Pop ONE batch from the front. If no batch is queued, deliver an
+        // empty batch (channel closes immediately) — this lets a long
+        // `--duration-seconds` test exit cleanly via the deadline.
+        let queued = {
+            let mut batches = self.update_batches.lock().unwrap();
+            if batches.is_empty() {
+                Vec::new()
+            } else {
+                batches.remove(0)
+            }
+        };
         let (tx, rx) = mpsc::channel::<MessageInfo>(32);
         tokio::spawn(async move {
             for evt in queued {
@@ -327,7 +366,8 @@ impl TelegramClient for MockClient {
                     return;
                 }
             }
-            // tx dropped here → receiver sees None (scripted feed exhausted).
+            // tx dropped here → receiver sees None (batch exhausted; the
+            // consumer must re-subscribe to drain the next batch).
         });
         Ok(rx)
     }

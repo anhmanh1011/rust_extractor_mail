@@ -228,6 +228,52 @@ async fn watch_gap_fills_messages_above_cursor_then_subscribes() {
 }
 
 #[tokio::test]
+async fn watch_reconnects_after_stream_closure_and_processes_post_reconnect_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("s.db")).unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    // Distinct bodies so sha256 dedup does NOT mask whether each batch
+    // round-tripped through the fetch dispatch.
+    let body_a = b"target.com:alice@x.com:pwd1\n".as_slice();
+    let body_b = b"target.com:bob@y.com:pwd2\n".as_slice();
+    let pre_a = doc(42, 100, "a.txt", body_a).0;
+    let post_b = doc(42, 101, "b.txt", body_b).0;
+    let mock = std::sync::Arc::new(
+        MockClient::new()
+            .with_document(pre_a.clone(), body_a.to_vec())
+            .with_document(post_b.clone(), body_b.to_vec()),
+    );
+    // Two scripted batches: the FIRST closes the stream after its last
+    // item; the SECOND is delivered only after the next subscribe call.
+    mock.script_updates_batches(vec![
+        vec![pre_a.clone()],  // batch 1
+        vec![post_b.clone()], // batch 2
+    ]);
+
+    let cfg = cfg_for(&out_dir, 7);
+    let args = WatchArgs {
+        duration_seconds: Some(3),
+        confirm_public: false,
+    };
+    run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
+        .await
+        .unwrap();
+
+    // Both messages produced one upload each, despite the stream closing
+    // mid-run.
+    assert_eq!(mock.uploaded.lock().unwrap().len(), 2);
+    assert_eq!(store.watch_cursor(42).unwrap(), Some(101));
+    // The mock saw subscribe_updates called at least twice.
+    assert!(
+        mock.subscribe_calls() >= 2,
+        "auto-reconnect did not re-subscribe; calls = {}",
+        mock.subscribe_calls()
+    );
+}
+
+#[tokio::test]
 async fn watch_does_not_advance_cursor_on_per_message_error() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(&tmp.path().join("store.db")).unwrap();

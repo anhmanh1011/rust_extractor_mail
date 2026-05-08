@@ -202,59 +202,33 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         }
     }
 
-    // 2. Open the live update stream.
-    let mut updates = client
-        .subscribe_updates(&chat_ids)
-        .await
-        .context("subscribe_updates")?;
-
-    // 3. Loop with optional time bound + Ctrl-C escape hatch.
+    // 2. Drive the live update stream with auto-reconnect on closure.
+    //    Per-message dispatch and cursor advance happen inside the closure;
+    //    `subscribe_with_reconnect` handles re-subscribing on stream close,
+    //    exponential backoff (1 s → 30 s cap), and honors --duration-seconds
+    //    + Ctrl-C.
     let deadline = args
         .duration_seconds
         .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
-    loop {
-        let info = tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("watch: Ctrl-C received, shutting down");
-                return Ok(());
-            }
-            () = async {
-                match deadline {
-                    Some(d) => tokio::time::sleep_until(d).await,
-                    None    => std::future::pending::<()>().await, // never
-                }
-            } => {
-                tracing::info!("watch: --duration-seconds elapsed, exiting");
-                return Ok(());
-            }
-            opt = updates.recv() => match opt {
-                Some(info) => info,
-                None => {
-                    tracing::warn!("watch: update stream closed by peer; exiting");
-                    return Ok(());
-                }
-            },
-        };
-
-        // 4. Dispatch one message through cmd::fetch::run_with_store_and_client.
-        let synth = crate::cmd::fetch::FetchArgs {
-            link: None,
-            chat: Some(info.chat_id),
-            msg_id: Some(info.msg_id),
-            no_upload: false,
-            confirm_public: args.confirm_public,
-        };
+    let confirm_public = args.confirm_public;
+    subscribe_with_reconnect(client, &chat_ids, deadline, |info| async move {
         let chat_id = info.chat_id;
         let msg_id = info.msg_id;
+        let synth = crate::cmd::fetch::FetchArgs {
+            link: None,
+            chat: Some(chat_id),
+            msg_id: Some(msg_id),
+            no_upload: false,
+            confirm_public,
+        };
         match crate::cmd::fetch::run_with_store_and_client(cfg, &synth, client, Some(store)).await {
             Ok(()) => {
-                // 5. Cursor advances on every observed message — including
-                //    dedup hits (AlreadyDone returns Ok). Title is best-effort:
-                //    we don't have it on `MessageInfo`, so reuse the
-                //    configured chat id; `update_watch_cursor` requires a
-                //    title. Fall back to the numeric id stringified — Phase 10
-                //    can pull a real title via `iter_dialogs`.
+                // Cursor advances on every observed message — including
+                // dedup hits (AlreadyDone returns Ok). Title is best-effort:
+                // we don't have it on `MessageInfo`, so reuse the
+                // configured chat id; `update_watch_cursor` requires a
+                // title. Fall back to the numeric id stringified — Phase 10
+                // can pull a real title via `iter_dialogs`.
                 let title = format!("chat:{chat_id}");
                 if let Err(e) = store.update_watch_cursor(chat_id, &title, i64::from(msg_id)) {
                     tracing::error!(?e, chat_id, msg_id, "watch: failed to advance cursor");
@@ -272,6 +246,103 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
                     "watch: per-message processing failed, continuing",
                 );
             }
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// Drive `client.subscribe_updates(chat_ids)` with reconnect-on-closure.
+/// `on_message` is called per `MessageInfo` and may return `Err` to
+/// terminate (e.g., orchestrator hung up). `deadline` is the wall-clock
+/// budget from `--duration-seconds`; `None` means run forever.
+///
+/// Backoff schedule: 1 s, 2 s, 4 s, 8 s, 16 s, 30 s, 30 s, … capped.
+/// Reset to 1 s after every successful subscribe. Ctrl-C aborts via
+/// `tokio::signal::ctrl_c` (biased select).
+pub(crate) async fn subscribe_with_reconnect<C, F, Fut>(
+    client: &C,
+    chat_ids: &[i64],
+    deadline: Option<tokio::time::Instant>,
+    mut on_message: F,
+) -> Result<()>
+where
+    C: TelegramClient,
+    F: FnMut(crate::telegram::MessageInfo) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut backoff_ms: u64 = 1_000;
+    loop {
+        // Honor deadline + Ctrl-C before subscribing.
+        if let Some(d) = deadline {
+            if tokio::time::Instant::now() >= d {
+                tracing::info!("watch: --duration-seconds elapsed, exiting");
+                return Ok(());
+            }
+        }
+
+        let mut rx = match client.subscribe_updates(chat_ids).await {
+            Ok(rx) => rx,
+            Err(e) => {
+                tracing::warn!(
+                    ?e,
+                    backoff_ms,
+                    "watch: subscribe_updates failed, backing off"
+                );
+                if !sleep_with_deadline(backoff_ms, deadline).await {
+                    return Ok(());
+                }
+                backoff_ms = (backoff_ms * 2).min(30_000);
+                continue;
+            }
+        };
+        // Successful subscribe → reset backoff.
+        backoff_ms = 1_000;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("watch: Ctrl-C received, shutting down");
+                    return Ok(());
+                }
+                _ = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None    => std::future::pending::<()>().await,
+                    }
+                } => {
+                    tracing::info!("watch: --duration-seconds elapsed, exiting");
+                    return Ok(());
+                }
+                opt = rx.recv() => match opt {
+                    Some(info) => {
+                        on_message(info).await?;
+                    }
+                    None => {
+                        tracing::warn!("watch: update stream closed by peer, will reconnect");
+                        break; // inner loop → re-subscribe
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Sleep for `ms` milliseconds, honoring `deadline` and Ctrl-C. Returns
+/// `false` if the deadline elapsed or Ctrl-C fired (caller exits).
+async fn sleep_with_deadline(ms: u64, deadline: Option<tokio::time::Instant>) -> bool {
+    let until = tokio::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let final_until = match deadline {
+        Some(d) if d < until => d,
+        _ => until,
+    };
+    tokio::select! {
+        biased;
+        _ = tokio::signal::ctrl_c()                   => false,
+        _ = tokio::time::sleep_until(final_until)     => {
+            // If the chopped sleep was the deadline, signal exit.
+            !matches!(deadline, Some(d) if final_until == d)
         }
     }
 }
