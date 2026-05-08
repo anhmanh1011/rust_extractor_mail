@@ -186,3 +186,43 @@ async fn watch_terminates_on_duration_seconds() {
         "duration_seconds did not honor the budget; elapsed {elapsed:?}",
     );
 }
+
+#[tokio::test]
+async fn watch_gap_fills_messages_above_cursor_then_subscribes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store_path = tmp.path().join("store.db");
+    let out_dir    = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let store = Store::open(&store_path).unwrap();
+
+    // Pre-seed cursor at msg_id=100. Three new messages exist in history:
+    // 101 (new, gap-fill), 102 (new, gap-fill), 103 (new, gap-fill).
+    // Then a live update arrives: 104.
+    store.update_watch_cursor(42, "Test", 100).unwrap();
+
+    // Distinct payloads per id so sha256 dedup does NOT mask whether each
+    // gap-fill message actually round-tripped through the fetch dispatch.
+    let mut docs: Vec<(MessageInfo, Vec<u8>)> = Vec::new();
+    for id in [101, 102, 103, 104] {
+        let body = format!("target.com:a{id}@x.com:p{id}\n").into_bytes();
+        docs.push(doc(42, id, &format!("m{id}.txt"), &body));
+    }
+    let mock = Arc::new(MockClient::new());
+    for (info, bytes) in &docs {
+        // Re-create with_document via a mutating helper since the builder
+        // returned `self` by value; here we use the inner Mutex directly.
+        mock.messages.lock().unwrap()
+            .insert((info.chat_id, info.msg_id), (info.clone(), bytes.clone()));
+    }
+    // History contains the gap (101..=103) newest-first; the live update is 104.
+    mock.script_history(42, vec![docs[2].0.clone(), docs[1].0.clone(), docs[0].0.clone()]);
+    mock.script_updates(vec![docs[3].0.clone()]);
+
+    let cfg  = cfg_for(&out_dir, 7);
+    let args = WatchArgs { duration_seconds: Some(2), confirm_public: false };
+    run_with_store_and_client(&cfg, &args, mock.as_ref(), &store).await.unwrap();
+
+    // All four messages were processed.
+    assert_eq!(mock.uploaded.lock().unwrap().len(), 4);
+    assert_eq!(store.watch_cursor(42).unwrap(), Some(104));
+}

@@ -112,6 +112,87 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         chat_ids.push(id);
     }
 
+    // 2a. Gap-fill: walk history backwards from the latest message until
+    //     msg_id ≤ cursor (or page returns empty). Done per chat,
+    //     newest-first to preserve a sensible processing order on restart.
+    //     Spec §6.4: between watch_cursor's last write and process restart,
+    //     messages posted to subscribed chats would be missed by
+    //     subscribe_updates alone — close that window here.
+    for &chat_id in &chat_ids {
+        let cursor = store
+            .watch_cursor(chat_id)
+            .with_context(|| format!("watch_cursor chat={chat_id}"))?
+            .unwrap_or(0);
+        let page_size = cfg.backfill.page_size.max(1); // reuse the same knob
+        let mut next_max: Option<i32> = None;
+        let mut stack: Vec<crate::telegram::MessageInfo> = Vec::new();
+        loop {
+            let page = client
+                .iter_history(chat_id, next_max, page_size)
+                .await
+                .with_context(|| {
+                    format!("gap-fill iter_history chat={chat_id} max={next_max:?}")
+                })?;
+            if page.is_empty() {
+                break;
+            }
+
+            // Stop once we cross the cursor. The page is descending, so the
+            // first msg_id <= cursor (and everything after it) is already
+            // processed.
+            let mut crossed = false;
+            for info in &page {
+                if i64::from(info.msg_id) <= cursor {
+                    crossed = true;
+                    break;
+                }
+                stack.push(info.clone());
+            }
+            if crossed {
+                break;
+            }
+            // Continue paging older.
+            next_max = page.last().map(|m| m.msg_id);
+        }
+
+        // Process oldest-first so cursor advances monotonically.
+        stack.reverse();
+        for info in stack {
+            let synth = crate::cmd::fetch::FetchArgs {
+                link:           None,
+                chat:           Some(info.chat_id),
+                msg_id:         Some(info.msg_id),
+                no_upload:      false,
+                confirm_public: args.confirm_public,
+            };
+            let cid = info.chat_id;
+            let mid = info.msg_id;
+            match crate::cmd::fetch::run_with_store_and_client(cfg, &synth, client, Some(store))
+                .await
+            {
+                Ok(()) => {
+                    let title = format!("chat:{cid}");
+                    if let Err(e) = store.update_watch_cursor(cid, &title, i64::from(mid)) {
+                        tracing::error!(
+                            ?e,
+                            chat_id = cid,
+                            msg_id = mid,
+                            "watch: gap-fill cursor write failed",
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        ?e,
+                        chat_id = cid,
+                        msg_id = mid,
+                        "watch: gap-fill per-message failed, continuing",
+                    );
+                }
+            }
+        }
+    }
+
     // 2. Open the live update stream.
     let mut updates = client
         .subscribe_updates(&chat_ids)
