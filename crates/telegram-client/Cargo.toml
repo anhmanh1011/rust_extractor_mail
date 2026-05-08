@@ -55,8 +55,14 @@ indicatif           = { workspace = true }
 # Filesystem helpers
 tempfile            = { workspace = true }
 
+# Time (Phase 9: backfill --since RFC-3339 parsing).
+chrono              = { workspace = true }
+
 [dev-dependencies]
 tempfile            = { workspace = true }
 # Phase 3+ tests rely on tokio's `test-util` (additive on top of the
 # runtime feature set declared at the workspace root):
 tokio               = { workspace = true, features = ["test-util"] }
+# Phase 9 backfill tests build RFC-3339 strings around the cutoff to
+# exercise the --since boundary deterministically.
+chrono              = { workspace = true }

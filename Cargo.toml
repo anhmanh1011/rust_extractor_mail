@@ -48,6 +48,10 @@ hex                 = "0.4"
 rusqlite            = { version = "0.31", default-features = false, features = ["bundled"] }
 tempfile            = "3"
 
+# Time (Phase 9: backfill --since RFC-3339 parsing).
+# Pure-Rust default; Cargo.lock already has 0.4.44 transitively.
+chrono              = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
 # Telegram
 # Note: pinned to 0.7 (caret) — 0.6 series was never published to crates.io.
 # The plan/spec (Phase 0) referenced 0.6 in error; bumped during Phase 2 Task 2.1.
