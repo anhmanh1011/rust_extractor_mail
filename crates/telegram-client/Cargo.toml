@@ -34,6 +34,7 @@ rpassword           = { workspace = true }
 flate2              = { workspace = true }
 zip                 = { workspace = true }
 sha2                = { workspace = true }
+hex                 = { workspace = true }
 memchr              = { workspace = true }
 memmap2             = { workspace = true }
 

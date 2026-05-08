@@ -44,7 +44,8 @@ zip                 = { version = "0.6", default-features = false, features = ["
 
 # Crypto / state
 sha2                = "0.10"
-rusqlite            = { version = "0.31", features = ["bundled"] }
+hex                 = "0.4"
+rusqlite            = { version = "0.31", default-features = false, features = ["bundled"] }
 tempfile            = "3"
 
 # Telegram
