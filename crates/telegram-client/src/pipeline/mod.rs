@@ -2,9 +2,11 @@
 pub mod coordinator;
 pub mod disk;
 pub mod format;
+pub mod sink;
 pub mod stream;
 
 pub use format::{detect as detect_format, Format};
+pub use sink::WriterSink;
 
 /// Per-file work item that flows through the pipeline. Filled in Task 4.x.
 #[derive(Debug)]
