@@ -217,7 +217,7 @@ impl TelegramClient for GrammersClient {
         let mut file = tokio::fs::File::open(path)
             .await
             .context("open upload")?;
-        let size = tokio::fs::metadata(path).await?.len() as usize;
+        let size = file.metadata().await.context("upload metadata")?.len() as usize;
         let name = path
             .file_name()
             .and_then(|s| s.to_str())
