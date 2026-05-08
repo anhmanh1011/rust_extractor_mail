@@ -14,7 +14,8 @@ pub enum MessageRef {
     },
     /// Private channel: chat_id is the t.me/c/<N> internal id with -100 prefix.
     ChatId {
-        /// MTProto chat_id (already shifted by `-1_000_000_000_000`).
+        /// MTProto chat_id: `-(1_000_000_000_000 + internal_id)`, the canonical
+        /// channel-id form Telegram derives from a `t.me/c/<internal_id>` link.
         chat_id: i64,
         /// Numeric message id within the chat.
         msg_id: i32,
@@ -28,17 +29,19 @@ pub enum MessageRef {
 pub fn parse_message_link(s: &str) -> Result<MessageRef> {
     if let Some(rest) = s.strip_prefix("tg://resolve?") {
         let mut domain = None;
-        let mut post   = None;
+        let mut post = None;
         for kv in rest.split('&') {
-            let (k, v) = kv.split_once('=').ok_or_else(|| anyhow!("malformed query: {kv}"))?;
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| anyhow!("malformed query: {kv}"))?;
             match k {
                 "domain" => domain = Some(v.to_string()),
-                "post"   => post   = Some(v.parse::<i32>().context("post must be int")?),
+                "post" => post = Some(v.parse::<i32>().context("post must be int")?),
                 _ => {}
             }
         }
         let username = domain.ok_or_else(|| anyhow!("tg://resolve missing domain"))?;
-        let msg_id   = post.ok_or_else(|| anyhow!("tg://resolve missing post"))?;
+        let msg_id = post.ok_or_else(|| anyhow!("tg://resolve missing post"))?;
         return Ok(MessageRef::Username { username, msg_id });
     }
 
@@ -49,17 +52,34 @@ pub fn parse_message_link(s: &str) -> Result<MessageRef> {
 
     if let Some(after_c) = rest.strip_prefix("c/") {
         let mut parts = after_c.splitn(2, '/');
-        let internal: i64 = parts.next().ok_or_else(|| anyhow!("missing chat segment"))?
-            .parse().context("internal id must be int")?;
-        let msg_id: i32  = parts.next().ok_or_else(|| anyhow!("missing msg_id"))?
-            .parse().context("msg_id must be int")?;
-        return Ok(MessageRef::ChatId { chat_id: -1_000_000_000_000_i64 - internal, msg_id });
+        let internal: i64 = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing chat segment"))?
+            .parse()
+            .context("internal id must be int")?;
+        let msg_id: i32 = parts
+            .next()
+            .ok_or_else(|| anyhow!("missing msg_id"))?
+            .parse()
+            .context("msg_id must be int")?;
+        return Ok(MessageRef::ChatId {
+            chat_id: -1_000_000_000_000_i64 - internal,
+            msg_id,
+        });
     }
 
     let mut parts = rest.splitn(2, '/');
     let username = parts.next().ok_or_else(|| anyhow!("missing username"))?;
-    if username.is_empty() { return Err(anyhow!("empty username")); }
-    let msg_id: i32 = parts.next().ok_or_else(|| anyhow!("missing msg_id"))?
-        .parse().context("msg_id must be int")?;
-    Ok(MessageRef::Username { username: username.into(), msg_id })
+    if username.is_empty() {
+        return Err(anyhow!("empty username"));
+    }
+    let msg_id: i32 = parts
+        .next()
+        .ok_or_else(|| anyhow!("missing msg_id"))?
+        .parse()
+        .context("msg_id must be int")?;
+    Ok(MessageRef::Username {
+        username: username.into(),
+        msg_id,
+    })
 }

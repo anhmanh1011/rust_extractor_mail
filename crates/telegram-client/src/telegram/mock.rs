@@ -25,9 +25,9 @@ impl MockClient {
     /// Create an empty mock with no dialogs, messages, joins, or uploads.
     pub fn new() -> Self {
         Self {
-            dialogs:  Mutex::new(Vec::new()),
+            dialogs: Mutex::new(Vec::new()),
             messages: Mutex::new(HashMap::new()),
-            joined:   Mutex::new(Vec::new()),
+            joined: Mutex::new(Vec::new()),
             uploaded: Mutex::new(Vec::new()),
         }
     }
@@ -40,18 +40,25 @@ impl MockClient {
 
     /// Builder: register a downloadable document keyed by its `(chat_id, msg_id)`.
     pub fn with_document(self, info: MessageInfo, bytes: Vec<u8>) -> Self {
-        self.messages.lock().unwrap().insert((info.chat_id, info.msg_id), (info, bytes));
+        self.messages
+            .lock()
+            .unwrap()
+            .insert((info.chat_id, info.msg_id), (info, bytes));
         self
     }
 }
 
 impl Default for MockClient {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[async_trait::async_trait]
 impl TelegramClient for MockClient {
-    async fn connect_and_warm(&self) -> Result<()> { Ok(()) }
+    async fn connect_and_warm(&self) -> Result<()> {
+        Ok(())
+    }
 
     async fn iter_dialogs(&self) -> Result<Vec<Dialog>> {
         Ok(self.dialogs.lock().unwrap().clone())
@@ -65,17 +72,22 @@ impl TelegramClient for MockClient {
     async fn resolve_chat(&self, r: &ChatRef) -> Result<i64> {
         match r {
             ChatRef::ChatId(id) => Ok(*id),
-            ChatRef::Username(name) => {
-                self.dialogs.lock().unwrap().iter()
-                    .find(|d| d.username.as_deref() == Some(name))
-                    .map(|d| d.chat_id)
-                    .ok_or_else(|| anyhow::anyhow!("mock: no dialog with username {name}"))
-            }
+            ChatRef::Username(name) => self
+                .dialogs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|d| d.username.as_deref() == Some(name))
+                .map(|d| d.chat_id)
+                .ok_or_else(|| anyhow::anyhow!("mock: no dialog with username {name}")),
         }
     }
 
     async fn message_info(&self, chat_id: i64, msg_id: i32) -> Result<MessageInfo> {
-        self.messages.lock().unwrap().get(&(chat_id, msg_id))
+        self.messages
+            .lock()
+            .unwrap()
+            .get(&(chat_id, msg_id))
             .map(|(info, _)| info.clone())
             .ok_or_else(|| anyhow::anyhow!("mock: no message {chat_id}/{msg_id}"))
     }
@@ -85,13 +97,19 @@ impl TelegramClient for MockClient {
         chat_id: i64,
         msg_id: i32,
     ) -> Result<mpsc::Receiver<Result<Bytes>>> {
-        let bytes = self.messages.lock().unwrap().get(&(chat_id, msg_id))
+        let bytes = self
+            .messages
+            .lock()
+            .unwrap()
+            .get(&(chat_id, msg_id))
             .map(|(_, b)| b.clone())
             .ok_or_else(|| anyhow::anyhow!("mock: no document {chat_id}/{msg_id}"))?;
         let (tx, rx) = mpsc::channel(4);
         tokio::spawn(async move {
             for chunk in bytes.chunks(1024) {
-                if tx.send(Ok(Bytes::copy_from_slice(chunk))).await.is_err() { break; }
+                if tx.send(Ok(Bytes::copy_from_slice(chunk))).await.is_err() {
+                    break;
+                }
             }
         });
         Ok(rx)
