@@ -93,39 +93,49 @@ impl Store {
     /// Insert a new `queued` row for `m`, or report the existing row's status.
     pub fn try_enqueue(&self, m: &FileMeta) -> Result<EnqueueResult> {
         let conn = self.lock();
-        let existing: Option<(String,)> = conn
+        // INSERT OR IGNORE atomically inserts iff sha256 is new; concurrent
+        // callers see rows_affected==0 and fall through to a status SELECT.
+        let rows_affected = conn
+            .execute(
+                "INSERT OR IGNORE INTO files (
+                    sha256, source_chat_id, source_msg_id, original_name,
+                    size_bytes, format, matcher_key, matcher_mode,
+                    discovered_at, status
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued')",
+                rusqlite::params![
+                    m.sha256,
+                    m.source_chat_id,
+                    m.source_msg_id,
+                    m.original_name,
+                    i64::try_from(m.size_bytes).unwrap_or(i64::MAX),
+                    m.format,
+                    m.matcher_key,
+                    m.matcher_mode,
+                    now_secs(),
+                ],
+            )
+            .with_context(|| format!("INSERT OR IGNORE files sha256={}", m.sha256))?;
+
+        if rows_affected == 1 {
+            return Ok(EnqueueResult::New);
+        }
+
+        // Row already existed: read its current status and report.
+        let status: String = conn
             .query_row(
                 "SELECT status FROM files WHERE sha256 = ?1",
                 rusqlite::params![m.sha256],
-                |r| Ok((r.get::<_, String>(0)?,)),
+                |r| r.get(0),
             )
-            .ok();
-        if let Some((status,)) = existing {
-            if status == "done" {
-                return Ok(EnqueueResult::AlreadyDone);
-            }
-            return Ok(EnqueueResult::InProgress(status));
+            .with_context(|| {
+                format!("SELECT status after no-op INSERT sha256={}", m.sha256)
+            })?;
+
+        if status == "done" {
+            Ok(EnqueueResult::AlreadyDone)
+        } else {
+            Ok(EnqueueResult::InProgress(status))
         }
-        conn.execute(
-            "INSERT INTO files (
-                sha256, source_chat_id, source_msg_id, original_name,
-                size_bytes, format, matcher_key, matcher_mode,
-                discovered_at, status
-             ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'queued')",
-            rusqlite::params![
-                m.sha256,
-                m.source_chat_id,
-                m.source_msg_id,
-                m.original_name,
-                m.size_bytes as i64,
-                m.format,
-                m.matcher_key,
-                m.matcher_mode,
-                now_secs(),
-            ],
-        )
-        .context("INSERT files")?;
-        Ok(EnqueueResult::New)
     }
 
     /// Transition `sha`'s row to `downloading`.
@@ -140,7 +150,7 @@ impl Store {
             "UPDATE files SET status='extracting', download_done_at=?1 WHERE sha256=?2",
             rusqlite::params![now_secs(), sha],
         )
-        .context("UPDATE files mark_downloaded")?;
+        .with_context(|| format!("UPDATE files mark_downloaded sha256={sha}"))?;
         Ok(())
     }
 
@@ -164,13 +174,13 @@ impl Store {
               WHERE sha256=?5",
             rusqlite::params![
                 now_secs(),
-                lines_scanned as i64,
-                lines_matched as i64,
+                i64::try_from(lines_scanned).unwrap_or(i64::MAX),
+                i64::try_from(lines_matched).unwrap_or(i64::MAX),
                 out.to_string_lossy(),
                 sha,
             ],
         )
-        .context("UPDATE files mark_extracted")?;
+        .with_context(|| format!("UPDATE files mark_extracted sha256={sha}"))?;
         Ok(())
     }
 
@@ -184,7 +194,7 @@ impl Store {
               WHERE sha256=?3",
             rusqlite::params![now_secs(), output_msg_id, sha],
         )
-        .context("UPDATE files mark_uploaded")?;
+        .with_context(|| format!("UPDATE files mark_uploaded sha256={sha}"))?;
         Ok(())
     }
 
@@ -195,7 +205,7 @@ impl Store {
             "UPDATE files SET status='failed', error=?1 WHERE sha256=?2",
             rusqlite::params![err, sha],
         )
-        .context("UPDATE files mark_failed")?;
+        .with_context(|| format!("UPDATE files mark_failed sha256={sha}"))?;
         Ok(())
     }
 
@@ -205,7 +215,7 @@ impl Store {
             "UPDATE files SET status=?1 WHERE sha256=?2",
             rusqlite::params![status, sha],
         )
-        .context("UPDATE files set_status")?;
+        .with_context(|| format!("UPDATE files set_status sha256={sha} status={status}"))?;
         Ok(())
     }
 }
