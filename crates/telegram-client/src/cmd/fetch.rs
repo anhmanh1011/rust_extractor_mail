@@ -130,7 +130,7 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
     // Per-source-file output path: <pipeline.output_dir>/<chat_id>/<msg_id>_<sanitized>.out
     let chat_dir = Path::new(&cfg.pipeline.output_dir).join(chat_id.to_string());
     std::fs::create_dir_all(&chat_dir).with_context(|| format!("mkdir {}", chat_dir.display()))?;
-    let stem = strip_known_ext(&sanitize(&info.file_name));
+    let stem = strip_known_ext(&sanitize(&info.original_name));
     let out_filename = format!("{msg_id}_{stem}.out");
     let out_path = join_safe(&chat_dir, &out_filename)
         .with_context(|| format!("join_safe under {}", chat_dir.display()))?;
@@ -145,7 +145,7 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         Some(Err(e)) => return Err(e.context("first chunk from download_stream")),
         None => Bytes::new(),
     };
-    let format = detect_format(&info.file_name, &first_chunk);
+    let format = detect_format(&info.original_name, &first_chunk);
     let is_gzip = match format {
         Format::Txt => false,
         Format::Gz => true,
@@ -166,7 +166,7 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         }
         Format::Unknown => bail!(
             "unknown format for {} (extension + magic both inconclusive)",
-            info.file_name
+            info.original_name
         ),
     };
 
@@ -229,7 +229,7 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
     tracing::info!(
         chat_id = info.chat_id,
         msg_id = info.msg_id,
-        file_name = %info.file_name,
+        file_name = %info.original_name,
         out = %out_path.display(),
         lines_scanned = stats.lines_scanned,
         lines_matched = stats.lines_matched,
@@ -249,8 +249,8 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
             sha256: sha.clone(),
             source_chat_id: chat_id,
             source_msg_id: msg_id,
-            original_name: info.file_name.clone(),
-            size_bytes: info.size,
+            original_name: info.original_name.clone(),
+            size_bytes: info.size_bytes,
             format: format_label(&format),
             matcher_key: cfg.extract.key.clone(),
             matcher_mode: match cfg.extract.mode {
@@ -387,7 +387,7 @@ async fn run_zip_path<C: TelegramClient>(
     tracing::info!(
         chat_id = info.chat_id,
         msg_id = info.msg_id,
-        file_name = %info.file_name,
+        file_name = %info.original_name,
         out = %out_path.display(),
         lines_scanned = stats.lines_scanned,
         lines_matched = stats.lines_matched,
@@ -404,8 +404,8 @@ async fn run_zip_path<C: TelegramClient>(
             sha256: sha.clone(),
             source_chat_id: chat_id,
             source_msg_id: msg_id,
-            original_name: info.file_name.clone(),
-            size_bytes: info.size,
+            original_name: info.original_name.clone(),
+            size_bytes: info.size_bytes,
             format: "zip".into(),
             matcher_key: cfg.extract.key.clone(),
             matcher_mode: match cfg.extract.mode {
@@ -481,7 +481,7 @@ async fn run_single_upload<C: TelegramClient>(
     store: Option<&crate::store::Store>,
 ) -> Result<()> {
     let caption_data = crate::upload::caption::CaptionData {
-        original_name: info.file_name.clone(),
+        original_name: info.original_name.clone(),
         source_chat_id,
         source_msg_id,
         matcher_key: cfg.extract.key.clone(),
@@ -489,7 +489,7 @@ async fn run_single_upload<C: TelegramClient>(
             ExtractMode::Plain => "plain".into(),
             ExtractMode::Url => "url".into(),
         },
-        size_bytes: info.size,
+        size_bytes: info.size_bytes,
         lines_scanned: stats.lines_scanned,
         lines_matched: stats.lines_matched,
     };

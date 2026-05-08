@@ -85,9 +85,10 @@ async fn fetch_stream_txt_writes_only_matches_to_expected_path() {
         MessageInfo {
             chat_id: 42,
             msg_id: 7,
-            file_name: "dump.txt".into(),
-            size: 1_000,
+            original_name: "dump.txt".into(),
+            size_bytes: 1_000,
             mime: None,
+            date: 0,
         },
         Vec::new(), // bytes unused -- script takes precedence
     ));
@@ -140,9 +141,10 @@ target.com:c@c.com:p3
         MessageInfo {
             chat_id: 1,
             msg_id: 1,
-            file_name: "dump.gz".into(),
-            size: gz.len() as u64,
+            original_name: "dump.gz".into(),
+            size_bytes: gz.len() as u64,
             mime: None,
+            date: 0,
         },
         Vec::new(), // bytes unused -- script takes precedence
     ));
@@ -183,9 +185,10 @@ async fn fetch_zip_extracts_all_text_entries() {
         MessageInfo {
             chat_id: 7,
             msg_id: 7,
-            file_name: "dump.zip".into(),
-            size: zip_bytes.len() as u64,
+            original_name: "dump.zip".into(),
+            size_bytes: zip_bytes.len() as u64,
             mime: None,
+            date: 0,
         },
         Vec::new(), // bytes unused -- script takes precedence
     ));
@@ -223,9 +226,10 @@ async fn fetch_link_resolves_to_chat_and_msg_id() {
                 MessageInfo {
                     chat_id: 5050,
                     msg_id: 12,
-                    file_name: "small.txt".into(),
-                    size: 26,
+                    original_name: "small.txt".into(),
+                    size_bytes: 26,
                     mime: None,
+                    date: 0,
                 },
                 Vec::new(), // bytes unused -- script takes precedence
             ),
@@ -266,9 +270,10 @@ async fn fetch_uploads_to_configured_chat_id() {
         MessageInfo {
             chat_id: 42,
             msg_id: 7,
-            file_name: "dump.txt".into(),
-            size: 1_000,
+            original_name: "dump.txt".into(),
+            size_bytes: 1_000,
             mime: None,
+            date: 0,
         },
         Vec::new(), // bytes unused -- script takes precedence
     ));
@@ -311,9 +316,10 @@ async fn fetch_skips_upload_when_no_upload_flag_set() {
         MessageInfo {
             chat_id: 1,
             msg_id: 1,
-            file_name: "x.txt".into(),
-            size: 10,
+            original_name: "x.txt".into(),
+            size_bytes: 10,
             mime: None,
+            date: 0,
         },
         Vec::new(),
     ));
@@ -347,9 +353,10 @@ async fn fetch_aborts_on_public_chat_without_confirm() {
         MessageInfo {
             chat_id: 1,
             msg_id: 1,
-            file_name: "x.txt".into(),
-            size: 10,
+            original_name: "x.txt".into(),
+            size_bytes: 10,
             mime: None,
+            date: 0,
         },
         Vec::new(),
     ));
@@ -387,9 +394,10 @@ async fn fetch_aborts_on_bare_username_without_confirm() {
         MessageInfo {
             chat_id: 1,
             msg_id: 1,
-            file_name: "x.txt".into(),
-            size: 10,
+            original_name: "x.txt".into(),
+            size_bytes: 10,
             mime: None,
+            date: 0,
         },
         Vec::new(),
     ));
@@ -427,9 +435,10 @@ async fn fetch_does_not_gate_numeric_chat_string() {
         MessageInfo {
             chat_id: 1,
             msg_id: 1,
-            file_name: "x.txt".into(),
-            size: 10,
+            original_name: "x.txt".into(),
+            size_bytes: 10,
             mime: None,
+            date: 0,
         },
         Vec::new(),
     ));
@@ -473,9 +482,10 @@ async fn fetch_persists_files_row_and_dedupes_on_second_run() {
         MessageInfo {
             chat_id: 42,
             msg_id: 7,
-            file_name: "dump.txt".into(),
-            size: 10,
+            original_name: "dump.txt".into(),
+            size_bytes: 10,
             mime: None,
+            date: 0,
         },
     );
     mock.script_download(
@@ -550,9 +560,10 @@ async fn fetch_no_upload_does_not_pollute_dedup_state() {
         MessageInfo {
             chat_id: 42,
             msg_id: 7,
-            file_name: "dump.txt".into(),
-            size: 10,
+            original_name: "dump.txt".into(),
+            size_bytes: 10,
             mime: None,
+            date: 0,
         },
     );
     mock.script_download(

@@ -49,11 +49,14 @@ pub struct MessageInfo {
     /// Numeric message id within the chat.
     pub msg_id: i32,
     /// Original file name as reported by the sender.
-    pub file_name: String,
+    pub original_name: String,
     /// Document size in bytes.
-    pub size: u64,
+    pub size_bytes: u64,
     /// MIME type, if the document carries one.
     pub mime: Option<String>,
+    /// Unix epoch seconds (UTC). Used by `cmd::backfill --since` cutoff and
+    /// by tracing/observability. May be 0 if upstream did not provide it.
+    pub date: i64,
 }
 
 /// Trait used by the pipeline so tests can substitute `MockClient`.
@@ -98,4 +101,41 @@ pub trait TelegramClient: Send + Sync {
         local_path: &std::path::Path,
         caption: Option<&str>,
     ) -> Result<i64>;
+
+    /// Walk the chat's history newest-first.
+    /// `max_id == None` starts from the most recent message.
+    /// `max_id == Some(n)` returns messages with `msg_id < n` (strictly).
+    /// `limit` is the maximum number of `MessageInfo` rows returned.
+    /// Implementations must skip non-document messages (text-only, stickers,
+    /// voice notes …) so the consumer never has to re-filter. An empty
+    /// page means "no more document-bearing messages older than `max_id`".
+    async fn iter_history(
+        &self,
+        chat_id: i64,
+        max_id: Option<i32>,
+        limit: u32,
+    ) -> Result<Vec<MessageInfo>>;
+
+    /// Subscribe to live new-message events on the given chat ids. The
+    /// returned receiver yields `MessageInfo` only for document-bearing
+    /// messages whose `chat_id` is in `chat_ids`. Implementations must
+    /// drop non-document messages and any message not in the configured
+    /// set so the caller does no further filtering.
+    ///
+    /// The receiver closes when:
+    ///   - the underlying connection is torn down, OR
+    ///   - the producer task exits (test-only path: scripted updates drained).
+    ///
+    /// `cmd::watch` treats receiver closure as "stream ended"; if the
+    /// daemon is meant to keep running, the caller is responsible for
+    /// reconnecting (re-calling `subscribe_updates`).
+    async fn subscribe_updates(
+        &self,
+        chat_ids: &[i64],
+    ) -> Result<tokio::sync::mpsc::Receiver<MessageInfo>>;
 }
+
+// Re-export `MockClient` from the `telegram` module so callers can import
+// it via `telegram_client::telegram::MockClient` (matches the import path
+// used in plan tests and §5.3).
+pub use mock::MockClient;

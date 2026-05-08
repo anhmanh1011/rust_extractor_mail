@@ -178,7 +178,7 @@ impl TelegramClient for GrammersClient {
         // Phase 4 (download path) calls this per file, so a `(chat_id → Chat)`
         // cache populated by warm-up MUST be added there to avoid re-walking
         // dialogs for every download. Tracked in Phase 4 Task 4.x.
-        let chat = self.find_chat(chat_id).await?;
+        let chat = self.chat_handle(chat_id).await?;
         let msgs = self
             .client
             .get_messages_by_id(&chat, &[msg_id])
@@ -192,13 +192,14 @@ impl TelegramClient for GrammersClient {
         let media = msg
             .media()
             .ok_or_else(|| anyhow!("message {chat_id}/{msg_id} has no media"))?;
-        let (file_name, size, mime) = doc_meta(&media)?;
+        let (original_name, size_bytes, mime) = doc_meta(&media)?;
         Ok(MessageInfo {
             chat_id,
             msg_id,
-            file_name,
-            size,
+            original_name,
+            size_bytes,
             mime,
+            date: msg.date().timestamp(),
         })
     }
 
@@ -211,7 +212,7 @@ impl TelegramClient for GrammersClient {
 
         // 1. Resolve message to media reference.
         let chat = self
-            .find_chat(chat_id)
+            .chat_handle(chat_id)
             .await
             .context("resolve chat for download_stream")?;
         let msg = self
@@ -248,7 +249,7 @@ impl TelegramClient for GrammersClient {
     }
 
     async fn upload_file(&self, chat: i64, path: &Path, caption: Option<&str>) -> Result<i64> {
-        let target = self.find_chat(chat).await?;
+        let target = self.chat_handle(chat).await?;
         let mut file = tokio::fs::File::open(path).await.context("open upload")?;
         let size = file.metadata().await.context("upload metadata")?.len() as usize;
         let name = path
@@ -273,11 +274,87 @@ impl TelegramClient for GrammersClient {
         // `Message::id()` returns i32 in grammers 0.7 — widen losslessly to i64.
         Ok(sent.id() as i64)
     }
+
+    async fn iter_history(
+        &self,
+        chat_id: i64,
+        max_id: Option<i32>,
+        limit: u32,
+    ) -> Result<Vec<MessageInfo>> {
+        let chat = self
+            .chat_handle(chat_id)
+            .await
+            .with_context(|| format!("resolve chat handle {chat_id} for history"))?;
+        let limit_us = usize::try_from(limit).unwrap_or(usize::MAX);
+        let mut iter = self.client.iter_messages(&chat).limit(limit_us);
+        // grammers exposes `offset_id` (returns messages with id < offset_id),
+        // which is the same semantic as the trait's `max_id` parameter.
+        if let Some(m) = max_id {
+            iter = iter.offset_id(m);
+        }
+        let mut out = Vec::with_capacity(limit_us);
+        while let Some(msg) = iter
+            .next()
+            .await
+            .with_context(|| format!("iter_messages chat={chat_id} max={max_id:?}"))?
+        {
+            if let Some(info) = message_to_info(&msg) {
+                out.push(info);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn subscribe_updates(
+        &self,
+        chat_ids: &[i64],
+    ) -> Result<tokio::sync::mpsc::Receiver<MessageInfo>> {
+        let want: std::collections::HashSet<i64> = chat_ids.iter().copied().collect();
+        let (tx, rx) = tokio::sync::mpsc::channel::<MessageInfo>(32);
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            // grammers' update loop. `next_update` blocks until an update or
+            // the connection is severed; in 0.7 it returns
+            // `Result<Update, InvocationError>` (no `Option` wrapping —
+            // errors / disconnects propagate as `Err` and end the loop).
+            // Document-only filtering happens here.
+            loop {
+                let update = match client.next_update().await {
+                    Ok(u) => u,
+                    Err(e) => {
+                        tracing::info!(error = %e, "subscribe_updates: next_update ended");
+                        return;
+                    }
+                };
+                use grammers_client::Update;
+                let msg = match update {
+                    Update::NewMessage(m) | Update::MessageEdited(m) => m,
+                    _ => continue,
+                };
+                let chat_id = msg.chat().id();
+                if !want.contains(&chat_id) {
+                    continue;
+                }
+                if let Some(info) = message_to_info(&msg) {
+                    if tx.send(info).await.is_err() {
+                        return; // receiver dropped
+                    }
+                }
+            }
+            // Connection closed → drop tx → consumer sees None.
+        });
+        Ok(rx)
+    }
 }
 
 impl GrammersClient {
     /// Helper: locate a `grammers Chat` by its numeric id (post warm-up).
-    async fn find_chat(&self, chat_id: i64) -> Result<Chat> {
+    ///
+    /// Lifted out of the per-method bodies in Task 8.1 so `iter_history`,
+    /// `download_stream`, `upload_file`, and `message_info` share a single
+    /// resolution path. Currently re-walks dialogs each call; Phase 4 Task
+    /// 4.x is tracked to add a `(chat_id → Chat)` cache populated by warm-up.
+    async fn chat_handle(&self, chat_id: i64) -> Result<Chat> {
         let mut iter = self.client.iter_dialogs();
         while let Some(d) = iter.next().await.context("iter_dialogs")? {
             if d.chat().id() == chat_id {
@@ -288,6 +365,28 @@ impl GrammersClient {
             "chat_id {chat_id} not in dialogs — run `chats` first or `join` if private"
         ))
     }
+}
+
+/// Extract a `MessageInfo` if the message carries a document with a
+/// non-empty file name; return `None` for text-only / sticker / voice / etc.
+fn message_to_info(msg: &grammers_client::types::Message) -> Option<MessageInfo> {
+    let media = msg.media()?;
+    let doc = match media {
+        Media::Document(d) => d,
+        _ => return None,
+    };
+    let name = doc.name().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(MessageInfo {
+        chat_id: msg.chat().id(),
+        msg_id: msg.id(),
+        original_name: name,
+        size_bytes: u64::try_from(doc.size().max(0)).unwrap_or(0),
+        mime: doc.mime_type().map(String::from),
+        date: msg.date().timestamp(),
+    })
 }
 
 /// Extract `(file_name, size, mime_type)` from a `Media::Document`.

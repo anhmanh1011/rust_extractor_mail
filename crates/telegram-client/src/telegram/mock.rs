@@ -54,6 +54,11 @@ pub struct MockClient {
     next_msg_id: AtomicI64,
     /// Scripted upload outcomes, drained FIFO. Empty = success with auto-allocated id.
     upload_script: Mutex<std::collections::VecDeque<UploadOutcome>>,
+    /// Per-chat scripted history. `iter_history` reads from here.
+    /// Stored newest-first (high msg_id → low msg_id).
+    pub history: Mutex<HashMap<i64, Vec<MessageInfo>>>,
+    /// Scripted updates queue (FIFO across all chats; consumer filters).
+    pub updates: Mutex<Vec<MessageInfo>>,
 }
 
 impl MockClient {
@@ -67,7 +72,26 @@ impl MockClient {
             download_scripts: Mutex::new(HashMap::new()),
             next_msg_id: AtomicI64::new(1_000),
             upload_script: Mutex::new(std::collections::VecDeque::new()),
+            history: Mutex::new(HashMap::new()),
+            updates: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Record a chat's scripted history newest-first.
+    ///
+    /// `iter_history` reads from this map. The page is sorted by msg_id
+    /// descending so callers may pass any order — the order they observe
+    /// from `iter_history` is always newest-first.
+    pub fn script_history(&self, chat_id: i64, mut page: Vec<MessageInfo>) {
+        page.sort_by_key(|m| std::cmp::Reverse(m.msg_id));
+        self.history.lock().unwrap().insert(chat_id, page);
+    }
+
+    /// Record live updates that `subscribe_updates` will deliver in order.
+    /// Append-only: each call extends the existing queue. Consumed (drained)
+    /// by the first `subscribe_updates` call after the script is staged.
+    pub fn script_updates(&self, evts: Vec<MessageInfo>) {
+        self.updates.lock().unwrap().extend(evts);
     }
 
     /// Push a sequence of upload outcomes consumed FIFO by `upload_file`.
@@ -266,5 +290,45 @@ impl TelegramClient for MockClient {
                 Ok(id)
             }
         }
+    }
+
+    async fn iter_history(
+        &self,
+        chat_id: i64,
+        max_id: Option<i32>,
+        limit: u32,
+    ) -> Result<Vec<MessageInfo>> {
+        let h = self.history.lock().unwrap();
+        let Some(page) = h.get(&chat_id) else {
+            return Ok(Vec::new());
+        };
+        let limit_us = usize::try_from(limit).unwrap_or(usize::MAX);
+        Ok(page
+            .iter()
+            .filter(|m| max_id.map_or(true, |x| m.msg_id < x))
+            .take(limit_us)
+            .cloned()
+            .collect())
+    }
+
+    async fn subscribe_updates(
+        &self,
+        chat_ids: &[i64],
+    ) -> Result<mpsc::Receiver<MessageInfo>> {
+        let want: std::collections::HashSet<i64> = chat_ids.iter().copied().collect();
+        let queued = std::mem::take(&mut *self.updates.lock().unwrap());
+        let (tx, rx) = mpsc::channel::<MessageInfo>(32);
+        tokio::spawn(async move {
+            for evt in queued {
+                if !want.contains(&evt.chat_id) {
+                    continue;
+                }
+                if tx.send(evt).await.is_err() {
+                    return;
+                }
+            }
+            // tx dropped here → receiver sees None (scripted feed exhausted).
+        });
+        Ok(rx)
     }
 }
