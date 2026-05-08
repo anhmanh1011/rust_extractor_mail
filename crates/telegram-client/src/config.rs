@@ -95,8 +95,8 @@ pub struct ExtractSection {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct WatchSection {
     /// One entry per `[[watch.channel]]` table in TOML.
-    #[serde(default)]
-    pub channel: Vec<WatchChannel>,
+    #[serde(default, rename = "channel")]
+    pub channels: Vec<WatchChannel>,
 }
 
 /// A single watched channel, optionally overriding `[extract]` for that channel.

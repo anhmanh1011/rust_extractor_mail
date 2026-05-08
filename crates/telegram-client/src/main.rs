@@ -48,7 +48,16 @@ async fn main() -> Result<()> {
             .context("GrammersClient::connect")?;
             telegram_client::cmd::fetch::run_with_store_and_client(&cfg, &args, &client, Some(&store)).await
         }
-        Cmd::Watch(args)           => telegram_client::cmd::watch::run(&cfg, &secrets, &args).await,
+        Cmd::Watch(args)           => {
+            let client = telegram_client::telegram::client::GrammersClient::connect(
+                secrets.api_id,
+                &secrets.api_hash,
+                std::path::Path::new(&cfg.telegram.session_path),
+            )
+            .await
+            .context("GrammersClient::connect")?;
+            telegram_client::cmd::watch::run_with_store_and_client(&cfg, &args, &client, &store).await
+        }
         Cmd::Backfill(args)        => telegram_client::cmd::backfill::run(&cfg, &secrets, &args).await,
         Cmd::RetryUploads          => {
             let target = match (cfg.telegram.output.chat_id, cfg.telegram.output.chat.as_deref()) {
