@@ -219,3 +219,74 @@ impl Store {
         Ok(())
     }
 }
+
+/// Upload-side row: a `files` row with `status='uploading'` and `output_path`
+/// already populated by `mark_extracted`.
+#[derive(Debug, Clone)]
+pub struct UploadJobRow {
+    /// Hex-encoded SHA-256 of the source file; primary key in the `files` table.
+    pub sha256:        String,
+    /// Filesystem path to the extracted output file ready for upload.
+    pub output_path:   std::path::PathBuf,
+    /// Telegram chat the source message lives in.
+    pub source_chat_id: i64,
+    /// Telegram message id carrying the source document.
+    pub source_msg_id:  i32,
+    /// Original file name as posted on Telegram.
+    pub original_name:  String,
+    /// Source size in bytes.
+    pub size_bytes:     u64,
+    /// Matcher rule key that selected this file.
+    pub matcher_key:    String,
+    /// Matcher mode tag — one of `"plain"`, `"url"`.
+    pub matcher_mode:   String,
+    /// Total lines scanned during extraction.
+    pub lines_scanned:  u64,
+    /// Lines that matched the rule during extraction.
+    pub lines_matched:  u64,
+}
+
+impl Store {
+    /// Recovery: rows stuck in `downloading` or `extracting` go back to
+    /// `queued`. Returns the number of rows reset.
+    pub fn reset_in_flight(&self) -> Result<usize> {
+        let conn = self.lock();
+        let n = conn.execute(
+            "UPDATE files SET status='queued'
+              WHERE status IN ('downloading','extracting')",
+            [],
+        ).context("UPDATE files reset_in_flight")?;
+        Ok(n)
+    }
+
+    /// All rows currently `status='uploading'` whose output_path is set.
+    /// Used by recovery to re-queue interrupted uploads, and by
+    /// `cmd::retry-uploads` together with `pending_failed_uploads`.
+    pub fn list_pending_uploads(&self) -> Result<Vec<UploadJobRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT sha256, output_path, source_chat_id, source_msg_id,
+                    original_name, size_bytes, matcher_key, matcher_mode,
+                    COALESCE(lines_scanned, 0), COALESCE(lines_matched, 0)
+               FROM files
+              WHERE status='uploading' AND output_path IS NOT NULL",
+        ).context("prepare list_pending_uploads")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(UploadJobRow {
+                sha256:         r.get::<_, String>(0)?,
+                output_path:    std::path::PathBuf::from(r.get::<_, String>(1)?),
+                source_chat_id: r.get::<_, i64>(2)?,
+                source_msg_id:  r.get::<_, i32>(3)?,
+                original_name:  r.get::<_, String>(4)?,
+                size_bytes:     u64::try_from(r.get::<_, i64>(5)?).unwrap_or(0),
+                matcher_key:    r.get::<_, String>(6)?,
+                matcher_mode:   r.get::<_, String>(7)?,
+                lines_scanned:  u64::try_from(r.get::<_, i64>(8)?).unwrap_or(0),
+                lines_matched:  u64::try_from(r.get::<_, i64>(9)?).unwrap_or(0),
+            })
+        }).context("query list_pending_uploads")?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
+    }
+}
