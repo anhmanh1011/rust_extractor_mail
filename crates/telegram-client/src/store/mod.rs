@@ -290,3 +290,112 @@ impl Store {
         Ok(out)
     }
 }
+
+/// Per-chat backfill cursor row — tracks how far backfill has walked back
+/// through history, plus a `completed_at` timestamp once the bottom of
+/// history is reached.
+#[derive(Debug, Clone)]
+pub struct BackfillState {
+    /// Telegram chat id this cursor belongs to.
+    pub chat_id:      i64,
+    /// Chat title at the time of the last update (renames eventually propagate).
+    pub chat_title:   String,
+    /// Next (lower) message id backfill should walk toward.
+    pub next_msg_id:  i64,
+    /// Unix-seconds timestamp when backfill first started for this chat.
+    pub started_at:   i64,
+    /// Unix-seconds timestamp once the oldest history has been consumed; `None` while still walking.
+    pub completed_at: Option<i64>,
+    /// Unix-seconds timestamp of the most recent advance.
+    pub updated_at:   i64,
+}
+
+impl Store {
+    /// Return the highest `last_msg_id` recorded for `chat_id`, or `None` if
+    /// the watch loop has never advanced past it.
+    pub fn watch_cursor(&self, chat_id: i64) -> Result<Option<i64>> {
+        let conn = self.lock();
+        match conn.query_row(
+            "SELECT last_msg_id FROM watch_state WHERE chat_id=?1",
+            rusqlite::params![chat_id],
+            |r| r.get::<_, i64>(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("SELECT watch_cursor chat_id={chat_id}")),
+        }
+    }
+
+    /// UPSERT the watch cursor for `chat_id` to `last`. The chat title is
+    /// refreshed on every call so renames eventually propagate.
+    pub fn update_watch_cursor(&self, chat_id: i64, title: &str, last: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO watch_state(chat_id, chat_title, last_msg_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id) DO UPDATE SET
+                 chat_title  = excluded.chat_title,
+                 last_msg_id = excluded.last_msg_id,
+                 updated_at  = excluded.updated_at",
+            rusqlite::params![chat_id, title, last, now_secs()],
+        )
+        .with_context(|| format!("UPSERT watch_state chat_id={chat_id}"))?;
+        Ok(())
+    }
+
+    /// Return the current `BackfillState` for `chat_id`, or `None` if
+    /// backfill has never started.
+    pub fn backfill_cursor(&self, chat_id: i64) -> Result<Option<BackfillState>> {
+        let conn = self.lock();
+        match conn.query_row(
+            "SELECT chat_id, chat_title, next_msg_id, started_at,
+                    completed_at, updated_at
+               FROM backfill_state WHERE chat_id=?1",
+            rusqlite::params![chat_id],
+            |r| Ok(BackfillState {
+                chat_id:      r.get(0)?,
+                chat_title:   r.get(1)?,
+                next_msg_id:  r.get(2)?,
+                started_at:   r.get(3)?,
+                completed_at: r.get(4)?,
+                updated_at:   r.get(5)?,
+            }),
+        ) {
+            Ok(st) => Ok(Some(st)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("SELECT backfill_cursor chat_id={chat_id}")),
+        }
+    }
+
+    /// UPSERT the backfill cursor: lowering `next_msg_id` as backfill walks
+    /// toward older history.
+    pub fn advance_backfill(&self, chat_id: i64, title: &str, next_msg_id: i64) -> Result<()> {
+        let now = now_secs();
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO backfill_state(chat_id, chat_title, next_msg_id,
+                                        started_at, completed_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, NULL, ?4)
+             ON CONFLICT(chat_id) DO UPDATE SET
+                 chat_title  = excluded.chat_title,
+                 next_msg_id = excluded.next_msg_id,
+                 updated_at  = excluded.updated_at",
+            rusqlite::params![chat_id, title, next_msg_id, now],
+        )
+        .with_context(|| format!("UPSERT backfill_state chat_id={chat_id}"))?;
+        Ok(())
+    }
+
+    /// Mark backfill as fully consumed for `chat_id` (oldest history reached).
+    pub fn complete_backfill(&self, chat_id: i64) -> Result<()> {
+        let conn = self.lock();
+        conn.execute(
+            "UPDATE backfill_state
+                SET completed_at=?1, updated_at=?1
+              WHERE chat_id=?2",
+            rusqlite::params![now_secs(), chat_id],
+        )
+        .with_context(|| format!("UPDATE backfill_state complete chat_id={chat_id}"))?;
+        Ok(())
+    }
+}
