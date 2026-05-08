@@ -27,7 +27,7 @@ struct Args {
     #[arg(long, default_value_t = 4 * 1024 * 1024)]
     chunk_size: usize,
 
-    /// URL mode (lines: <url>:<email>:<password>)
+    /// URL mode (lines: `<url>:<email>:<password>`)
     #[arg(long)]
     url: bool,
 }

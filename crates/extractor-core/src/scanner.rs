@@ -146,9 +146,8 @@ impl<'m> Scanner<'m> {
             return Ok(stats);
         }
         let line = std::mem::take(&mut self.carry);
-        match self.match_and_emit(&line, sink)? {
-            true  => stats.lines_matched = 1,
-            false => {}
+        if self.match_and_emit(&line, sink)? {
+            stats.lines_matched = 1;
         }
         stats.lines_scanned = 1;
         Ok(stats)
