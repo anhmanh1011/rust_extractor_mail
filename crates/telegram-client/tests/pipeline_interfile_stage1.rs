@@ -23,6 +23,7 @@ fn cfg_with_dir(dir: std::path::PathBuf) -> PipelineConfig {
         upload_max_size_bytes:       2 * 1024 * 1024 * 1024,
         upload_rate_seconds:         0,
         target_chat_id:              42,
+        progress:                    None,
     }
 }
 

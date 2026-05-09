@@ -141,6 +141,10 @@ pub struct PipelineConfig {
     pub upload_rate_seconds: u64,
     /// Telegram chat id receiving extractor output messages.
     pub target_chat_id: i64,
+    /// Optional indicatif container. `None` means bars are suppressed
+    /// (non-TTY, CI, daemon mode). Stages must check `is_some` before
+    /// allocating bars; the no-bar path must be a true no-op.
+    pub progress: Option<Arc<indicatif::MultiProgress>>,
 }
 
 /// Drive the inter-file pipeline to completion. Returns `Ok(())` when
@@ -240,7 +244,7 @@ pub enum Stage1Out {
 /// treated as cooperative cancellation and returns Ok).
 pub async fn download_stage<C: TelegramClient + ?Sized>(
     client:      &C,
-    _cfg:        &PipelineConfig,
+    cfg:         &PipelineConfig,
     mut jobs_rx: mpsc::Receiver<Job>,
     s1_tx:       mpsc::Sender<Stage1Out>,
 ) -> Result<()> {
@@ -284,7 +288,15 @@ pub async fn download_stage<C: TelegramClient + ?Sized>(
                 }).await
             }
             Format::Zip => {
-                match drain_to_tempfile(first, chunks_in).await {
+                let label = format!("dl {chat}/{msg}");
+                let pb = crate::pipeline::progress::make_bar(
+                    cfg.progress.as_ref(),
+                    &label,
+                    Some(job.info.size_bytes),
+                );
+                let drain_res = drain_to_tempfile(first, chunks_in, &pb).await;
+                pb.finish_and_clear();
+                match drain_res {
                     Ok(temp) => s1_tx.send(Stage1Out::Disk { job, format, temp }).await,
                     Err(e)   => s1_tx.send(Stage1Out::Failed {
                         job, error: e.context("download zip → tempfile"),
@@ -309,6 +321,7 @@ pub async fn download_stage<C: TelegramClient + ?Sized>(
 async fn drain_to_tempfile(
     first:        Bytes,
     mut chunks:   mpsc::Receiver<Result<Bytes>>,
+    pb:           &indicatif::ProgressBar,
 ) -> Result<NamedTempFile> {
     use tokio::io::AsyncWriteExt;
     let temp     = tempfile::NamedTempFile::new().context("NamedTempFile::new")?;
@@ -317,13 +330,17 @@ async fn drain_to_tempfile(
     let mut f    = tokio::fs::File::from_std(std_file);
 
     if !first.is_empty() {
+        let n = first.len() as u64;
         f.write_all(&first).await
             .with_context(|| format!("write first chunk to {}", path.display()))?;
+        pb.inc(n);
     }
     while let Some(item) = chunks.recv().await {
         let b = item.context("zip download chunk")?;
+        let n = b.len() as u64;
         f.write_all(&b).await
             .with_context(|| format!("write chunk to {}", path.display()))?;
+        pb.inc(n);
     }
     f.flush().await.context("flush tempfile")?;
     drop(f);    // close handle so Stage 2 can mmap the path
@@ -427,20 +444,30 @@ async fn handle_stream(
     let first = first_chunk.clone();
     let pipe_tx_first = pipe_tx.clone();
     let hash_tx_first = hash_tx.clone();
+    let pb_dl = crate::pipeline::progress::make_bar(
+        cfg.progress.as_ref(),
+        &format!("dl {}/{}", job.source_chat_id, job.source_msg_id),
+        Some(job.info.size_bytes),
+    );
     let teer = tokio::spawn(async move {
         if !first.is_empty() {
+            let n = first.len() as u64;
             if pipe_tx_first.send(first.clone()).await.is_err() { return; }
             if hash_tx_first.send(first).await.is_err()         { return; }
+            pb_dl.inc(n);
         }
         while let Some(item) = chunks.recv().await {
             match item {
                 Ok(b) => {
+                    let n = b.len() as u64;
                     if pipe_tx.send(b.clone()).await.is_err() { return; }
                     if hash_tx.send(b).await.is_err()         { return; }
+                    pb_dl.inc(n);
                 }
                 Err(_) => return,
             }
         }
+        pb_dl.finish_and_clear();
     });
 
     let matcher = match make_matcher(cfg) {
@@ -735,6 +762,27 @@ pub async fn upload_stage<C: TelegramClient + ?Sized>(
                 job, sha256, output_path,
                 lines_scanned, lines_matched, format: _format,
             } => {
+                // Upload bar: presence signals "this file is mid-upload",
+                // length is the prepared output size. The grammers v0.7
+                // upload API does not expose a per-chunk callback, so the
+                // bar does not move during the upload itself; v1.1 will
+                // thread a real callback. `finish_and_clear` after
+                // upload::run drops it cleanly.
+                let total_up = std::fs::metadata(&output_path).map(|m| m.len()).ok();
+                let label_up = format!(
+                    "up {}",
+                    output_path
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+                let pb_up = crate::pipeline::progress::make_bar(
+                    cfg.progress.as_ref(),
+                    &label_up,
+                    total_up,
+                );
+                pb_up.set_message("uploading");
+
                 let (in_tx, in_rx)       = mpsc::channel::<UploadJob>(1);
                 let (out_tx, mut out_rx) = mpsc::channel::<UploadOutcome>(1);
                 let caption = CaptionData {
@@ -756,6 +804,7 @@ pub async fn upload_stage<C: TelegramClient + ?Sized>(
                     .await
                     .is_err()
                 {
+                    pb_up.finish_and_clear();
                     on_outcome(JobOutcome {
                         job,
                         kind: OutcomeKind::Failed {
@@ -781,6 +830,7 @@ pub async fn upload_stage<C: TelegramClient + ?Sized>(
                 let upload_run = upload::run(client, in_rx, out_tx, &upload_cfg, on_failed);
                 let drainer    = async { out_rx.recv().await };
                 let (upload_res, outcome_opt) = tokio::join!(upload_run, drainer);
+                pb_up.finish_and_clear();
                 if let Err(e) = upload_res {
                     on_outcome(JobOutcome {
                         job,

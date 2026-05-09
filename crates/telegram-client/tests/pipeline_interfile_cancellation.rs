@@ -61,6 +61,7 @@ async fn dropping_jobs_tx_cleanly_shuts_pipeline_down() {
         upload_max_size_bytes:       2 * 1024 * 1024 * 1024,
         upload_rate_seconds:         0,
         target_chat_id:              42,
+        progress:                    None,
     };
 
     let r = tokio::time::timeout(

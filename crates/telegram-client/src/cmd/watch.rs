@@ -63,6 +63,11 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &WatchArgs) -> Result
 /// Build a [`crate::pipeline::interfile::PipelineConfig`] from the loaded
 /// [`AppConfig`] plus a resolved `target_chat_id`. Default outcomes-channel
 /// capacity is 2 (spec §4.2).
+///
+/// `progress` is `None` to keep this helper environment-agnostic; the
+/// subcommand entry points (`run_with_store_and_client` for watch and
+/// backfill) overwrite the field with a TTY-conditional `MultiProgress`
+/// before passing the cfg into the orchestrator.
 pub(crate) fn pipeline_config_from_app(
     cfg: &AppConfig,
     target_chat_id: i64,
@@ -84,6 +89,19 @@ pub(crate) fn pipeline_config_from_app(
         upload_max_size_bytes:       cfg.pipeline.upload_max_size_bytes,
         upload_rate_seconds:         cfg.pipeline.upload_rate_seconds,
         target_chat_id,
+        progress:                    None,
+    }
+}
+
+/// Construct a `MultiProgress` only when stderr is a TTY. CI / cron /
+/// daemon environments get `None` so progress bars do not pollute logs.
+/// Spec §10.3.
+pub(crate) fn make_progress_if_tty() -> Option<std::sync::Arc<indicatif::MultiProgress>> {
+    use std::io::IsTerminal as _;
+    if std::io::stderr().is_terminal() {
+        Some(std::sync::Arc::new(indicatif::MultiProgress::new()))
+    } else {
+        None
     }
 }
 
@@ -185,7 +203,11 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
     .ok_or_else(|| anyhow!("watch: telegram.output.{{chat,chat_id}} unset"))?;
 
     // 3. Build PipelineConfig and the (jobs_tx, jobs_rx) channel.
-    let pcfg = pipeline_config_from_app(cfg, target_chat_id);
+    //    TTY check at this layer: if stderr is a terminal we surface a
+    //    `MultiProgress` for download/upload bars; in CI/cron/daemon mode
+    //    bars are suppressed at the source so logs stay clean (spec §10.3).
+    let mut pcfg = pipeline_config_from_app(cfg, target_chat_id);
+    pcfg.progress = make_progress_if_tty();
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<Job>(2);
 
     // 4. CursorAdvance callback: persist watch_cursor on every outcome,

@@ -197,7 +197,9 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
     .ok_or_else(|| anyhow!("backfill: telegram.output.{{chat,chat_id}} unset"))?;
 
     // 5. Build PipelineConfig and the (jobs_tx, jobs_rx) channel.
-    let pcfg = crate::cmd::watch::pipeline_config_from_app(cfg, target_chat_id);
+    //    TTY check at this layer: see `cmd::watch::make_progress_if_tty`.
+    let mut pcfg = crate::cmd::watch::pipeline_config_from_app(cfg, target_chat_id);
+    pcfg.progress = crate::cmd::watch::make_progress_if_tty();
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<Job>(2);
 
     // 6. CursorAdvance callback: advance_backfill on every outcome, and

@@ -3,6 +3,7 @@ pub mod coordinator;
 pub mod disk;
 pub mod format;
 pub mod interfile;
+pub mod progress;
 pub mod sink;
 pub mod stream;
 pub mod upload;
