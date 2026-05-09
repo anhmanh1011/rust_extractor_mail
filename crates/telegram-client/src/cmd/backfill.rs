@@ -1,13 +1,21 @@
-//! `backfill` subcommand. Phase 9: walk a single chat's history backwards
-//! from the most recent message (or `--resume`'s `backfill_cursor`)
-//! towards either the channel beginning or a `--since` UTC cutoff.
+//! `backfill` subcommand. Phase 10 (Task 10.10): walk a single chat's
+//! history backwards from the most recent message (or `--resume`'s
+//! `backfill_cursor`) towards the channel beginning or a `--since` UTC
+//! cutoff, feeding each [`crate::telegram::MessageInfo`] as a [`Job`]
+//! into a single [`crate::pipeline::interfile::run`] orchestrator
+//! invocation (lifts the Phase-9 "sequential per-message" deferral).
 //!
-//! Pagination is via `iter_history(max_id, page_size)`; per-message
-//! dispatch through [`crate::cmd::fetch::run_with_store_and_client`] reuses
-//! the dedup, format detection, and upload retry path used by `fetch` and
-//! `watch`. The `backfill_state` table records `(chat_id, next_msg_id)` so
-//! a `--limit`-truncated run can be resumed; once history is exhausted (or
-//! the `--since` cutoff is hit) `complete_backfill` stamps `completed_at`.
+//! Cursor advancement and dead-letter recording happen inside the
+//! [`CursorAdvance`] callback — the cursor advances on EVERY outcome
+//! (including [`OutcomeKind::Failed`]) so a poison-pill message does not
+//! make `--resume` loop forever. `complete_backfill` is stamped only on
+//! natural exhaustion (`iter_history` returns an empty page); a
+//! `--since`-bounded or `--limit`-bounded run leaves the cursor open so a
+//! later `--resume` can continue past the prior cutoff.
+//!
+//! [`Job`]: crate::pipeline::interfile::Job
+//! [`CursorAdvance`]: crate::pipeline::interfile::CursorAdvance
+//! [`OutcomeKind::Failed`]: crate::pipeline::interfile::OutcomeKind::Failed
 
 use anyhow::{anyhow, Context, Result};
 
@@ -46,6 +54,14 @@ pub struct BackfillArgs {
     /// resolved chat. If the prior row is already complete this is a no-op.
     #[arg(long, default_value_t = false)]
     pub resume: bool,
+
+    /// Required to send extracted output into a public destination chat
+    /// (mirrors `--confirm-public` on `watch`). Default: false. Spec §11.2:
+    /// long-running backfills into a public chat are exactly the operator
+    /// footgun the gate is designed to catch — a silent default would be
+    /// indistinguishable from explicit deny.
+    #[arg(long, default_value_t = false)]
+    pub confirm_public: bool,
 }
 
 /// Stand-alone entry point used by callers that don't already hold a
@@ -78,37 +94,36 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &BackfillArgs) -> Res
 /// 1. Warm the client (no-op for `MockClient`; warms dialogs for the real client).
 /// 2. Resolve `args.chat` to a numeric chat id (numeric → parsed; otherwise
 ///    via `client.resolve_chat`). The leading `@` on usernames is stripped.
-/// 3. Compute `since_unix` from `args.since.or(cfg.backfill.since)` via
+/// 3. Compute the starting `next_max: Option<i32>` from `--resume`. With
+///    `--resume` this is `backfill_state.next_msg_id` (errors out if the
+///    row is missing; logs and exits `Ok(())` if it is already complete).
+///    Without `--resume` it is `None` (start at the most recent message).
+/// 4. Compute `since_unix` from `args.since.or(cfg.backfill.since)` via
 ///    `chrono::DateTime::parse_from_rfc3339`.
-/// 4. Compute the starting `next_max: Option<i32>`. With `--resume` this is
-///    `backfill_state.next_msg_id` (errors out if the row is missing; logs
-///    and exits Ok if it is already complete). Without `--resume` it is
-///    `None` (start at the most recent message).
-/// 5. Loop: page `iter_history(chat_id, next_max, page_size)`. An empty
-///    page is "history exhausted" → break with `completed_naturally = true`.
-///    For each message in the page:
-///      - If `info.date <= since_unix` (when `--since` is set) → break with
-///        `completed_naturally = true` (cutoff hit).
-///      - Otherwise dispatch through
-///        [`crate::cmd::fetch::run_with_store_and_client`] with
-///        `confirm_public = false` (backfill never auto-confirms public
-///        uploads; users must set `chat_id` explicitly in TOML).
-///      - On Ok: increment `processed`, advance the cursor, and break the
-///        pages loop if `--limit` has been reached.
-///      - On Err: log and continue. The cursor is **not** advanced for a
-///        failed message so a subsequent `--resume` re-processes it.
+/// 5. Resolve the destination chat ONCE (spec §11.2: bail before any
+///    download if the public-chat gate trips and `--confirm-public` is
+///    not set).
+/// 6. Build the inter-file pipeline: a [`PipelineConfig`] from `cfg`, a
+///    bounded `(jobs_tx, jobs_rx)` channel, and a [`CursorAdvance`]
+///    callback that — for every outcome including `Failed` — advances
+///    `backfill_state.next_msg_id` and (for `Failed`) records a
+///    `dead_letter` row before advancing.
+/// 7. Concurrently feed history pages newest-first onto `jobs_tx` and
+///    await [`crate::pipeline::interfile::run`]. Track WHY the feed loop
+///    terminated (`--since`, `--limit`, orchestrator-died, or natural
+///    exhaustion) so `complete_backfill` is stamped iff exhaustion was
+///    natural.
 ///
-///    After the page is fully consumed, advance `next_max` to the oldest
-///    `msg_id` seen so the next page returns strictly older messages.
-/// 6. If the loop terminated naturally (empty page or `--since` hit), stamp
-///    `complete_backfill`. A `--limit` truncation leaves the cursor open
-///    for resume.
+/// [`PipelineConfig`]: crate::pipeline::interfile::PipelineConfig
+/// [`CursorAdvance`]: crate::pipeline::interfile::CursorAdvance
 pub async fn run_with_store_and_client<C: TelegramClient>(
     cfg: &AppConfig,
     args: &BackfillArgs,
     client: &C,
     store: &Store,
 ) -> Result<()> {
+    use crate::pipeline::interfile::{self, CursorAdvance, Job, JobOutcome, OutcomeKind};
+
     client
         .connect_and_warm()
         .await
@@ -129,19 +144,11 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
             .with_context(|| format!("backfill: resolve {:?}", args.chat))?
     };
 
-    // 2. Resolve --since cutoff (CLI wins over TOML).
-    let since_str: Option<&str> = args.since.as_deref().or(cfg.backfill.since.as_deref());
-    let since_unix: Option<i64> = match since_str {
-        None => None,
-        Some(s) => Some(
-            chrono::DateTime::parse_from_rfc3339(s)
-                .with_context(|| format!("backfill: parse --since {s:?} as RFC-3339"))?
-                .timestamp(),
-        ),
-    };
-
-    // 3. Decide starting max_id from --resume.
-    let mut next_max: Option<i32> = if args.resume {
+    // 2. Decide starting max_id from --resume. Done BEFORE output-chat
+    //    resolution and pipeline construction so a `--resume` against an
+    //    already-completed cursor returns Ok(()) without spinning up the
+    //    pipeline.
+    let mut max_id: Option<i32> = if args.resume {
         let st = store
             .backfill_cursor(chat_id)
             .with_context(|| format!("backfill_cursor chat={chat_id}"))?
@@ -153,10 +160,9 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
             );
             return Ok(());
         }
-        // `next_msg_id` is `i64` in the schema (Telegram's reply chains
-        // theoretically allow up to i32::MAX, but we widen on storage).
-        // Narrowing back to `i32` for `iter_history` is fallible — surface
-        // the overflow as an error rather than truncating silently.
+        // `next_msg_id` is `i64` in the schema; `iter_history` wants `i32`.
+        // Narrowing must be fallible per the project's "no `as` for narrowing"
+        // rule.
         Some(i32::try_from(st.next_msg_id).with_context(|| {
             format!(
                 "backfill: cursor next_msg_id {} overflows i32 for iter_history",
@@ -167,114 +173,188 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         None
     };
 
-    // 4. Loop-invariant: chat_id never changes inside the page/message loops,
-    //    so build the cursor title once. Mirrors the Task 8.3 hoist that the
-    //    `cmd::watch` gap-fill pass adopted.
-    let title = format!("chat:{chat_id}");
+    // 3. Resolve --since cutoff (CLI wins over TOML).
+    let since_str: Option<&str> = args.since.as_deref().or(cfg.backfill.since.as_deref());
+    let since_unix: Option<i64> = match since_str {
+        None => None,
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .with_context(|| format!("backfill: parse --since {s:?} as RFC-3339"))?
+                .timestamp(),
+        ),
+    };
 
-    let page_size = cfg.backfill.page_size.max(1);
-    let mut processed: u32 = 0;
-    let mut completed_naturally = false;
-    let mut last_seen_msg_id: Option<i32> = None;
+    // 4. Resolve output chat ONCE (spec §11.2 public-chat gate). Symmetric
+    //    with `cmd::watch`; a long-running backfill into a public chat is
+    //    exactly the operator footgun the gate exists for.
+    let target_chat_id = crate::cmd::fetch::resolve_output_chat_for_watch(
+        cfg,
+        args.confirm_public,
+        client,
+    )
+    .await
+    .context("backfill: resolve output chat")?
+    .ok_or_else(|| anyhow!("backfill: telegram.output.{{chat,chat_id}} unset"))?;
 
-    'pages: loop {
-        let page = client
-            .iter_history(chat_id, next_max, page_size)
-            .await
-            .with_context(|| format!("iter_history chat={chat_id} max={next_max:?}"))?;
-        if page.is_empty() {
-            // History exhausted: no more document-bearing messages older
-            // than `next_max` (or older than the most recent message on the
-            // first iteration).
-            completed_naturally = true;
-            break;
-        }
-        for info in &page {
-            // 4a. --since cutoff. Cutoff is exclusive: only messages whose
-            //     date is strictly greater than `since_unix` are processed;
-            //     the first message at-or-below the cutoff terminates the run.
-            if let Some(cut) = since_unix {
-                if info.date <= cut {
-                    completed_naturally = true;
-                    break 'pages;
-                }
-            }
+    // 5. Build PipelineConfig and the (jobs_tx, jobs_rx) channel.
+    let pcfg = crate::cmd::watch::pipeline_config_from_app(cfg, target_chat_id);
+    let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<Job>(2);
 
-            // 4b. Dispatch via cmd::fetch::run_with_store_and_client to reuse
-            //     dedup + format detection + upload retry.
-            let synth = crate::cmd::fetch::FetchArgs {
-                link: None,
-                chat: Some(info.chat_id),
-                msg_id: Some(info.msg_id),
-                no_upload: false,
-                // backfill never auto-confirms public chats; the user must
-                // pin a numeric `output.chat_id` in TOML for an unattended
-                // backfill to upload.
-                confirm_public: false,
-            };
-            match crate::cmd::fetch::run_with_store_and_client(cfg, &synth, client, Some(store))
-                .await
-            {
-                Ok(()) => {
-                    processed += 1;
-                    last_seen_msg_id = Some(info.msg_id);
-                    if let Err(e) = store.advance_backfill(chat_id, &title, i64::from(info.msg_id))
-                    {
-                        // A cursor-write failure is a *persistence* problem,
-                        // not a per-message processing problem. Log and
-                        // press on so the run can still report progress;
-                        // the user can `--resume` from the prior cursor.
-                        tracing::error!(
-                            ?e,
-                            chat_id,
-                            msg_id = info.msg_id,
-                            "backfill: advance_backfill write failed",
-                        );
-                    }
-                    if let Some(lim) = args.limit {
-                        if processed >= lim {
-                            // --limit reached: stop without stamping
-                            // completed_at so a follow-up --resume can
-                            // continue from `next_msg_id`.
-                            break 'pages;
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Per-message failures are logged + skipped without
-                    // advancing the cursor. A subsequent `--resume`
-                    // re-processes the failed message.
+    // 6. CursorAdvance callback: advance_backfill on every outcome, and
+    //    record_dead_letter on Failed before advancing past the poison
+    //    message. The callback owns an Arc-cloned Store handle; the Arc
+    //    is cheap (no SQLite-side cost) and shares the same Mutex<Connection>
+    //    as the caller's `store` reference.
+    let store_arc: std::sync::Arc<Store> = std::sync::Arc::new(store.clone_handle());
+    let cb_store = store_arc.clone();
+    let advance: CursorAdvance = std::sync::Arc::new(move |o: JobOutcome| {
+        let chat_id = o.job.source_chat_id;
+        let msg_id  = o.job.source_msg_id;
+        let title   = format!("chat:{chat_id}");
+        match &o.kind {
+            OutcomeKind::Uploaded { .. } | OutcomeKind::Deduped { .. } => {
+                if let Err(e) =
+                    cb_store.advance_backfill(chat_id, &title, i64::from(msg_id))
+                {
                     tracing::error!(
                         ?e,
                         chat_id,
-                        msg_id = info.msg_id,
-                        "backfill: per-message processing failed, continuing",
+                        msg_id,
+                        "backfill: advance_backfill failed",
+                    );
+                }
+            }
+            OutcomeKind::Failed { error } => {
+                let err = anyhow::anyhow!(error.clone());
+                if let Err(e) = cb_store.record_dead_letter(
+                    chat_id,
+                    msg_id,
+                    None,
+                    &o.job.info.original_name,
+                    o.job.info.size_bytes,
+                    crate::cmd::watch::classify_format(&o.job.info),
+                    crate::cmd::watch::classify_stage(&err),
+                    &crate::cmd::watch::one_line(&err),
+                ) {
+                    tracing::error!(
+                        ?e,
+                        chat_id,
+                        msg_id,
+                        "backfill: record_dead_letter failed",
+                    );
+                }
+                // Cursor MUST advance past the poison pill so a subsequent
+                // --resume doesn't re-attempt it forever.
+                if let Err(e) =
+                    cb_store.advance_backfill(chat_id, &title, i64::from(msg_id))
+                {
+                    tracing::error!(
+                        ?e,
+                        chat_id,
+                        msg_id,
+                        "backfill: advance past dead-letter failed",
                     );
                 }
             }
         }
-        // Advance to the older page. `iter_history` returns newest-first, so
-        // the *last* entry in the page is the oldest; using its msg_id as
-        // the next `max_id` requests messages strictly older than it.
-        next_max = page.last().map(|m| m.msg_id);
-    }
+    });
 
+    // 7. Run the orchestrator concurrently with the feeder. The
+    //    orchestrator borrows `&C` and `&Store`, so `tokio::join!` over
+    //    async blocks (not `tokio::spawn`) avoids `'static` bounds.
+    let pipeline_fut = async {
+        interfile::run(client, Some(store_arc.as_ref()), &pcfg, jobs_rx, advance).await
+    };
+
+    let page_size = cfg.backfill.page_size.max(1);
+    let limit_bound: u64 = args.limit.map(u64::from).unwrap_or(u64::MAX);
+
+    // Track WHY the feed loop exits so the post-run `complete_backfill`
+    // decision is precise: only natural exhaustion (next iter_history page
+    // empty) marks the run complete. `--since`, `--limit`, and orchestrator
+    // death all leave the cursor open for `--resume`.
+    let mut total_dispatched: u64 = 0;
+    let mut terminated_via_cutoff:   bool = false;
+    let mut terminated_via_limit:    bool = false;
+    let mut terminated_via_pipeline: bool = false;
+
+    // Feed loop owns `jobs_tx` so it is dropped on exit, signalling EOF to
+    // the orchestrator so Stage 1 can drain.
+    let feed_then_close = async {
+        let result: Result<()> = async {
+            loop {
+                let page = client
+                    .iter_history(chat_id, max_id, page_size)
+                    .await
+                    .with_context(|| format!("iter_history chat={chat_id} max={max_id:?}"))?;
+                if page.is_empty() {
+                    // Natural exhaustion — no other terminated_via_* flag is set.
+                    return Ok(());
+                }
+                let mut should_stop = false;
+                for info in page {
+                    if let Some(cut) = since_unix {
+                        if info.date <= cut {
+                            terminated_via_cutoff = true;
+                            should_stop = true;
+                            break;
+                        }
+                    }
+                    if total_dispatched >= limit_bound {
+                        terminated_via_limit = true;
+                        should_stop = true;
+                        break;
+                    }
+
+                    max_id = Some(info.msg_id);
+                    let job = Job {
+                        source_chat_id: info.chat_id,
+                        source_msg_id:  info.msg_id,
+                        info,
+                    };
+                    if jobs_tx.send(job).await.is_err() {
+                        // Orchestrator hung up; cooperate by exiting cleanly.
+                        terminated_via_pipeline = true;
+                        should_stop = true;
+                        break;
+                    }
+                    total_dispatched += 1;
+                }
+                if should_stop {
+                    return Ok(());
+                }
+            }
+        }
+        .await;
+        drop(jobs_tx);
+        result
+    };
+
+    let (feed_res, run_res) = tokio::join!(feed_then_close, pipeline_fut);
+    feed_res?;
+    run_res?;
+
+    // 8. Mark complete iff exhaustion was natural — none of `--since`,
+    //    `--limit`, or orchestrator-death triggered the stop.
+    let completed_naturally =
+        !terminated_via_cutoff && !terminated_via_limit && !terminated_via_pipeline;
     if completed_naturally {
         store
             .complete_backfill(chat_id)
             .with_context(|| format!("complete_backfill chat={chat_id}"))?;
         tracing::info!(
             chat_id,
-            processed,
-            last_seen_msg_id,
-            "backfill: run complete",
+            total_dispatched,
+            "backfill: run complete (history exhausted)",
         );
     } else {
         tracing::info!(
             chat_id,
-            processed,
-            last_seen_msg_id,
-            "backfill: --limit reached, run is resumable",
+            total_dispatched,
+            terminated_via_cutoff,
+            terminated_via_limit,
+            terminated_via_pipeline,
+            "backfill: run is resumable (cursor not finalized)",
         );
     }
 

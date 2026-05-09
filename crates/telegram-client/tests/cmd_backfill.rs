@@ -118,6 +118,7 @@ async fn backfill_walks_history_until_limit() {
         since: None,
         limit: Some(4),
         resume: false,
+        confirm_public: false,
     };
     run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
         .await
@@ -143,8 +144,13 @@ async fn backfill_walks_history_until_limit() {
     );
 }
 
+// Phase 10 (Task 10.10) policy change: a `--since`-bounded run is NOT
+// natural exhaustion. The cursor is left open (`completed_at = NULL`) so a
+// later run with an earlier cutoff (or no cutoff) can `--resume` and pick
+// up older history past the previous cutoff. Prior to Phase 10 this test
+// asserted the opposite (the run was treated as complete on cutoff).
 #[tokio::test]
-async fn backfill_stops_at_since_cutoff_and_marks_complete() {
+async fn backfill_stops_at_since_cutoff_without_marking_complete() {
     let tmp = tempfile::tempdir().unwrap();
     let store = Store::open(&tmp.path().join("store.db")).unwrap();
     let out_dir = tmp.path().join("out");
@@ -181,6 +187,7 @@ async fn backfill_stops_at_since_cutoff_and_marks_complete() {
         since: None,
         limit: None,
         resume: false,
+        confirm_public: false,
     };
     run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
         .await
@@ -197,8 +204,14 @@ async fn backfill_stops_at_since_cutoff_and_marks_complete() {
         .unwrap()
         .expect("backfill_state row must exist after at least one advance");
     assert!(
-        bf.completed_at.is_some(),
-        "since-cutoff run is complete: completed_at must be stamped",
+        bf.completed_at.is_none(),
+        "since-cutoff run is NOT natural exhaustion: completed_at must remain NULL \
+         so a later run with an earlier cutoff can --resume past this cutoff",
+    );
+    // Cursor points at the last successfully dispatched message (D-1 = msg 4).
+    assert_eq!(
+        bf.next_msg_id, 4,
+        "cursor should rest on the oldest dispatched msg before the cutoff",
     );
 }
 
@@ -237,6 +250,7 @@ async fn backfill_marks_complete_when_history_exhausts() {
         since: None,
         limit: None,
         resume: false,
+        confirm_public: false,
     };
     run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
         .await
@@ -310,6 +324,7 @@ async fn backfill_resume_continues_from_persisted_cursor() {
         since: None,
         limit: Some(3),
         resume: false,
+        confirm_public: false,
     };
     run_with_store_and_client(&cfg_a, &args_a, mock.as_ref(), &store)
         .await
@@ -339,6 +354,7 @@ async fn backfill_resume_continues_from_persisted_cursor() {
         since: None,
         limit: None,
         resume: true,
+        confirm_public: false,
     };
     run_with_store_and_client(&cfg_a, &args_b, mock.as_ref(), &store)
         .await
@@ -384,6 +400,7 @@ async fn backfill_resume_without_prior_run_errors() {
         since: None,
         limit: None,
         resume: true,
+        confirm_public: false,
     };
     let err = run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
         .await
@@ -424,6 +441,7 @@ async fn backfill_resume_when_already_complete_is_a_noop() {
         since: None,
         limit: None,
         resume: true,
+        confirm_public: false,
     };
     run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
         .await
@@ -432,5 +450,105 @@ async fn backfill_resume_when_already_complete_is_a_noop() {
     assert!(
         mock.uploaded.lock().unwrap().is_empty(),
         "--resume on a completed cursor must not dispatch anything",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 10.10: pipeline-driven dispatch + dead-letter on per-message failure.
+// ---------------------------------------------------------------------------
+
+/// Build a `MessageInfo` with explicit mime so the regression test below can
+/// pin a `.zip` document at a single `msg_id`. The existing [`doc`] helper
+/// hard-codes mime to `text/plain`, which is fine for txt fixtures but
+/// would mis-classify a corrupt zip as a stream-path job.
+fn msg_info_mime(
+    chat_id: i64,
+    msg_id: i32,
+    name: &str,
+    size_bytes: u64,
+    mime: &str,
+    date: i64,
+) -> MessageInfo {
+    MessageInfo {
+        chat_id,
+        msg_id,
+        original_name: name.into(),
+        size_bytes,
+        mime: Some(mime.into()),
+        date,
+    }
+}
+
+/// One scripted history page: msg 50 = good txt, msg 49 = corrupt zip,
+/// msg 48 = good txt. The pipeline must record msg 49 as a `dead_letter`
+/// row, advance the cursor past it, and continue on to msg 48 — and the
+/// cursor must end at the OLDEST dispatched msg (48) once Stage 3 has
+/// drained, with `complete_backfill` stamped because iter_history
+/// exhausted naturally on the next page.
+#[tokio::test]
+async fn backfill_advances_cursor_and_dead_letters_through_pipeline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("store.db")).unwrap();
+    let out_dir = tmp.path().join("out");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let body_50 = b"target.com:alice@x.com:pwd1\n".as_slice();
+    let body_48 = b"target.com:bob@x.com:pwd2\n".as_slice();
+    let bad     = b"abcde".as_slice();
+
+    let info_50 = msg_info_mime(42, 50, "a.txt",     body_50.len() as u64, "text/plain",      1_700_000_050);
+    let info_49 = msg_info_mime(42, 49, "evil.zip",  bad.len()     as u64, "application/zip", 1_700_000_049);
+    let info_48 = msg_info_mime(42, 48, "b.txt",     body_48.len() as u64, "text/plain",      1_700_000_048);
+
+    let mock = Arc::new(MockClient::new());
+    {
+        let mut messages = mock.messages.lock().unwrap();
+        messages.insert((42, 50), (info_50.clone(), body_50.to_vec()));
+        messages.insert((42, 49), (info_49.clone(), bad.to_vec()));
+        messages.insert((42, 48), (info_48.clone(), body_48.to_vec()));
+    }
+    mock.script_history(42, vec![info_50.clone(), info_49.clone(), info_48.clone()]);
+
+    let cfg = cfg_for(&out_dir, /*target*/ 7, /*page_size*/ 10, /*since*/ None);
+    let args = BackfillArgs {
+        chat: "42".into(),
+        since: None,
+        limit: None,
+        resume: false,
+        confirm_public: false,
+    };
+    run_with_store_and_client(&cfg, &args, mock.as_ref(), &store)
+        .await
+        .unwrap();
+
+    // Two uploads (50 and 48); 49 was dead-lettered.
+    assert_eq!(
+        mock.uploaded.lock().unwrap().len(),
+        2,
+        "exactly two good messages (50, 48) should be uploaded; 49 dead-lettered",
+    );
+
+    let dead = store.dead_letters().unwrap();
+    assert_eq!(dead.len(), 1, "the corrupt zip should produce one dead_letter row");
+    assert_eq!(dead[0].source_chat_id, 42);
+    assert_eq!(dead[0].source_msg_id,  49);
+    assert_eq!(dead[0].format,         "zip");
+    // Stage classification is best-effort; the corrupt zip surfaces as an
+    // extract-stage failure (zip header parse / disk_extract error chain).
+    assert_eq!(dead[0].stage,          "extract");
+    assert_eq!(dead[0].original_name,  "evil.zip");
+
+    // Cursor advances past every observed msg_id, ending at the oldest
+    // (48) — Stage-3 callbacks fire FIFO, last advance wins.
+    let bf = store
+        .backfill_cursor(42)
+        .unwrap()
+        .expect("backfill_state row must exist after pipeline drains");
+    assert_eq!(bf.next_msg_id, 48);
+    // History exhausted on the next iter_history page (single page → no
+    // older messages) → completed_at is stamped.
+    assert!(
+        bf.completed_at.is_some(),
+        "natural exhaustion (next page empty) → completed_at must be stamped",
     );
 }
