@@ -30,12 +30,25 @@ impl SecretScrubLayer {
     /// Construct a fresh `SecretScrubLayer`.
     pub fn new() -> Self { Self }
 
-    /// Match against `(?i)hash|key|secret|token|password|auth` (per spec §7.4).
+    /// Match against `(?i)hash|key|secret|token|password|auth|session`
+    /// (per spec §7.4 + §11.2 row 1 — `session` is a bearer credential).
     pub fn is_secret_key(name: &str) -> bool {
         let lower = name.to_ascii_lowercase();
-        ["hash", "key", "secret", "token", "password", "auth"]
+        ["hash", "key", "secret", "token", "password", "auth", "session"]
             .iter()
             .any(|needle| lower.contains(needle))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_secret_key_matches_session() {
+        assert!(SecretScrubLayer::is_secret_key("session"));
+        assert!(SecretScrubLayer::is_secret_key("session_id"));
+        assert!(SecretScrubLayer::is_secret_key("user_session"));
     }
 }
 
