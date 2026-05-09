@@ -1,0 +1,46 @@
+name: security-audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Mondays 09:00 UTC.
+    - cron: '0 9 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-
+
+      # Note: deliberately NOT caching the cargo-audit binary itself.
+      # `cargo install --locked --version ^0.22` re-installs from the cached
+      # registry in ~30s on Ubuntu and avoids the cache-poison failure mode
+      # where a half-installed binary persists across runs. The `^0.22`
+      # SemVer range admits the latest 0.22.x patch (the 0.21 line cannot
+      # parse the CVSS 4.0 entries that landed in the upstream advisory-db
+      # in late 2025; bumping is mandatory for the audit job to start).
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version ^0.22
+
+      - name: Run cargo audit
+        run: cargo audit --deny warnings

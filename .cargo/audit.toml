@@ -1,0 +1,9 @@
+# Empty by design. Every entry below is a reviewable decision to ship a
+# build despite a known RUSTSEC advisory. Don't add entries casually.
+#
+# Spec section 11.2: "cargo audit in CI; pinned versions; review changelog on bump"
+
+[advisories]
+ignore = []
+informational_warnings = ["unmaintained"]   # warn but don't fail build
+severity_threshold     = "low"              # everything >= low fails
