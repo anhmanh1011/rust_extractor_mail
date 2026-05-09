@@ -83,6 +83,6 @@ async fn main() -> Result<()> {
             .context("GrammersClient::connect")?;
             telegram_client::cmd::retry_uploads::run_with_store_and_client(&store, &client, &upload_cfg).await
         }
-        Cmd::Stats                 => telegram_client::cmd::stats::run(&cfg).await,
+        Cmd::Stats                 => telegram_client::cmd::stats::run(&cfg, &store).await,
     }
 }

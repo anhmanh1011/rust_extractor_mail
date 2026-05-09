@@ -555,6 +555,61 @@ impl Store {
         Ok(())
     }
 
+    /// Spec §10.4 input #1: aggregate file counts grouped by `status`.
+    /// Returns a `Vec<(status, count)>` in unspecified order — caller sorts
+    /// for display.
+    pub fn count_files_by_status(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare("SELECT status, COUNT(*) FROM files GROUP BY status")
+            .context("prepare count_files_by_status")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .context("query count_files_by_status")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row count_files_by_status")?);
+        }
+        Ok(out)
+    }
+
+    /// Spec §10.4 input #2: per-channel breakdown.
+    /// Returns `Vec<(chat_id, status, count)>` in unspecified order.
+    pub fn count_files_by_chat_status(&self) -> Result<Vec<(i64, String, i64)>> {
+        let conn = self.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT source_chat_id, status, COUNT(*)
+                   FROM files
+                  GROUP BY source_chat_id, status",
+            )
+            .context("prepare count_files_by_chat_status")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .context("query count_files_by_chat_status")?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.context("row count_files_by_chat_status")?);
+        }
+        Ok(out)
+    }
+
+    /// Spec §10.4 input #4: how many uploads are pending retry. Surfaces
+    /// "queue silently piling up" as a one-line stat.
+    pub fn failed_upload_count(&self) -> Result<i64> {
+        let conn = self.lock();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM failed_uploads", [], |r| r.get(0))
+            .context("SELECT COUNT failed_uploads")?;
+        Ok(n)
+    }
+
     /// Read every dead_letter row, oldest-first. Used by Phase 11's
     /// `stats` subcommand and by tests; production callers do not consume
     /// the dead-letter table outside of audit/CLI surface.
