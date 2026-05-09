@@ -117,7 +117,16 @@ async fn tempfile_is_deleted_after_success() {
         .await
         .unwrap();
     let snap_after = list_temp_prefix("tg-extract-spill-");
-    assert_eq!(snap_before, snap_after, "tempfile leaked");
+    // Sibling tests in this binary share %TEMP% and may create/clean up
+    // their own tg-extract-spill-* tempfiles between the two snapshots, so
+    // strict equality races. The property under test is "this disk_extract
+    // did not leak"; assert snap_after has no tempfile absent from
+    // snap_before.
+    let leaked: Vec<_> = snap_after
+        .iter()
+        .filter(|p| !snap_before.contains(p))
+        .collect();
+    assert!(leaked.is_empty(), "tempfile leaked: {leaked:?}");
 }
 
 fn list_temp_prefix(prefix: &str) -> Vec<std::path::PathBuf> {
