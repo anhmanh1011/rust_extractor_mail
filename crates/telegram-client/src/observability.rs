@@ -40,18 +40,6 @@ impl SecretScrubLayer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn is_secret_key_matches_session() {
-        assert!(SecretScrubLayer::is_secret_key("session"));
-        assert!(SecretScrubLayer::is_secret_key("session_id"));
-        assert!(SecretScrubLayer::is_secret_key("user_session"));
-    }
-}
-
 /// Visitor used by the `FormatFields` impl. Rewrites secret-named values to
 /// `<redacted>` for EVERY `Visit::record_*` overload — non-string values
 /// (i64, bool, etc.) MUST be redacted too, otherwise an event like
@@ -191,4 +179,16 @@ pub fn init(level: &str, format: &str, file: Option<&Path>, rotation: &str) -> L
 fn supports_color() -> bool {
     use std::io::IsTerminal;
     std::io::stderr().is_terminal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_secret_key_matches_session() {
+        assert!(SecretScrubLayer::is_secret_key("session"));
+        assert!(SecretScrubLayer::is_secret_key("session_id"));
+        assert!(SecretScrubLayer::is_secret_key("user_session"));
+    }
 }
