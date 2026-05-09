@@ -1,30 +1,96 @@
-# tg-extract example configuration. Copy to config.toml and edit.
-# Secrets (TG_API_ID, TG_API_HASH) come from environment variables;
-# see README and spec section 7 for details.
+# tg-extract example configuration. Copy to `config.toml` and edit.
+#
+# Secrets (TG_API_ID, TG_API_HASH) come from environment variables —
+# they are NEVER read from this file. The `Secrets` struct redacts
+# `api_hash` from `Debug` and intentionally does not implement `Display`.
+# Session files (`*.session`) are bearer credentials — never commit,
+# never log. See README and spec §7 for details.
 
 [telegram]
+# Path to the grammers session file. Created on first `auth`.
+# - On Unix: chmod 0600 immediately after creation.
+# - On Windows: relies on the per-user profile directory's ACL — keep
+#   `session_path` under `%LOCALAPPDATA%` or `%APPDATA%`, NOT a shared
+#   drive.
+# `~` expands to the user's home directory. `RUST_TG_SESSION` overrides
+# this at runtime.
 session_path                = "~/.config/tg-extract/session.session"
+
+# Concurrent download chunks per file. 4 is the upstream grammers default
+# and works well for files in the 500 MB – 2 GB target range. If parallel
+# chunk downloads prove unstable on a 2 GB file, drop to 1 to fall back
+# to sequential. (Spec §13: known risk.)
 download_concurrent_chunks  = 4
 
 [telegram.output]
-chat = "@my_results_channel"     # OR  chat_id = -1001234567890
+# Telegram channel that receives the filtered .out files. Use ONE of
+# these forms (validation rejects "neither"):
+#   chat    = "@my_results_channel"     # public username
+#   chat_id = -1001234567890            # MTProto numeric (negative for channels)
+# The user account MUST have post permission on this channel.
+chat = "@my_results_channel"
 
 [pipeline]
+# Where in-flight tempfiles for the .zip disk-spill path live. Tempfiles
+# are deleted on success; on Ctrl-C the tempfile RAII deletes them too.
+# This dir should NOT be committed (.gitignore blocks `work_dir/`).
 work_dir                      = "~/.local/share/tg-extract"
+
+# Where filtered .out files are written. Created if missing. The
+# pipeline strips path components from incoming filenames before
+# writing here (no zip-slip / path traversal — see output.rs).
 output_dir                    = "./out"
+
+# Per-chunk byte size for streaming downloads. 1 MiB is the spec
+# default. Validation rejects values < 64 KiB.
 chunk_bytes                   = 1048576
+
+# Intra-file channel capacity (download chunks → extractor). 4 keeps
+# the extractor close to the wire-rate without unbounded buffering.
 intra_file_channel_capacity   = 4
+
+# Inter-file channel capacity (one job → next stage). 1 enforces the
+# spec §4.2 cap=1 contract: at most one file in extract+write at a
+# time. Raise only if you have benchmarks justifying it.
 inter_file_channel_capacity   = 1
+
+# Capacity of the upload mpsc channel (Stage 3 inbox). 2 lets one
+# upload retry run concurrently with the next ready file.
 upload_channel_capacity       = 2
+
+# Cap on bytes per scanned line. Lines longer than this are dropped
+# with a tracing::warn event. Defends against pathological dumps.
+# Validation rejects values < 1024.
 max_line_bytes                = 65536
+
+# Min seconds between successive upload calls. Defends against
+# FLOOD_WAIT spirals when the channel sees a burst of large files.
 upload_rate_seconds           = 3
+
+# Max .out file size that fits in one Telegram message (2 GB cap).
+# Above this, the pipeline splits into multiple part-NNNN files.
 upload_max_size_bytes         = 2147483648
-max_uncompressed_bytes        = 10737418240   # 10 GB zip-bomb guard
+
+# Hard cap on uncompressed bytes when extracting a .zip. Above this,
+# the extract aborts and the file is dead-lettered. Defends against
+# zip bombs (spec §11.2). Do not weaken this — it is the only
+# zip-bomb guard.
+max_uncompressed_bytes        = 10737418240   # 10 GB
 
 [extract]
-mode = "plain"                   # "plain" | "url"
+# "plain" → `domain:txt1:txt2` lines.
+# "url"   → `<scheme>://<host>[/path]:<email>:<password>` lines.
+mode = "plain"
+
+# Domain to suffix-match (gmail.com matches mail.gmail.com but rejects
+# xgmail.com and gmail.com.vn). Validation rejects an empty key.
 key  = "gmail.com"
 
+# Watch sources. Add one [[watch.channel]] block per channel `tg-extract
+# watch` should subscribe to. Each block accepts the same `chat` /
+# `chat_id` form as `[telegram.output]`. An optional inline
+# `extract = { mode = "url", key = "linkedin.com" }` per-channel
+# override is supported (see commented example below).
 [[watch.channel]]
 chat = "@dump_channel_a"
 
@@ -33,11 +99,29 @@ chat_id = -1001999888777
 # extract = { mode = "url", key = "linkedin.com" }   # optional override
 
 [backfill]
+# History page size for `tg-extract backfill`. 100 matches the grammers
+# default for `iter_history`.
 page_size = 100
+
+# Walk no further back than this UTC timestamp. Combine with
+# --resume / --limit on the CLI.
 since     = "2024-01-01T00:00:00Z"
 
 [log]
+# Min level: trace | debug | info | warn | error. Overridable at
+# runtime via `RUST_LOG`.
 level    = "info"
-format   = "human"               # "human" | "json"
+
+# "human" — pretty stderr output for interactive use.
+# "json"  — structured stderr + file output for daemon/cron.
+format   = "human"
+
+# Optional file appender. Comment out to disable. The path is the
+# stem; the rolling appender adds a date / hour suffix per `rotation`.
 file     = "~/.local/share/tg-extract/log/app.log"
-rotation = "daily"               # "never" | "daily" | "hourly"
+
+# "never" | "daily" | "hourly". Daily is the operational default.
+# `tracing-appender` rotates on first write past the boundary.
+rotation = "daily"
+
+# vim: set ft=toml:
