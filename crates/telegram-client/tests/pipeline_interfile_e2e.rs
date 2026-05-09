@@ -52,7 +52,7 @@ async fn three_jobs_flow_in_order() {
     }
     // Script ALL upload outcomes in one call (FIFO). `script_upload` REPLACES
     // the queue, so multiple calls would only retain the last entry.
-    mock.script_upload(vec![
+    let mock = mock.script_upload(vec![
         UploadOutcome::Ok(1011),
         UploadOutcome::Ok(1012),
         UploadOutcome::Ok(1013),
@@ -132,7 +132,7 @@ async fn pipeline_processes_zip_through_disk_path() {
         (info.chat_id, info.msg_id),
         (info.clone(), zip_bytes),
     );
-    mock.script_upload(vec![UploadOutcome::Ok(50_555)]);
+    let mock = mock.script_upload(vec![UploadOutcome::Ok(50_555)]);
 
     let tmp = tempfile::tempdir().unwrap();
     let cfg = cfg_with_dir(tmp.path().to_path_buf());

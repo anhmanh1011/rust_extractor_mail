@@ -31,8 +31,7 @@ fn fast_policy() -> RetryPolicy {
 
 #[tokio::test]
 async fn happy_path_two_jobs_two_outputs() {
-    let mock = Arc::new(MockClient::new());
-    mock.script_upload(vec![Mock::Ok(101), Mock::Ok(102)]);
+    let mock = Arc::new(MockClient::new().script_upload(vec![Mock::Ok(101), Mock::Ok(102)]));
 
     let tmp = tempfile::tempdir().unwrap();
     let p1 = tmp.path().join("a.out");
@@ -95,11 +94,10 @@ async fn happy_path_two_jobs_two_outputs() {
 
 #[tokio::test]
 async fn permanent_failure_calls_on_failed_and_continues() {
-    let mock = Arc::new(MockClient::new());
-    mock.script_upload(vec![
+    let mock = Arc::new(MockClient::new().script_upload(vec![
         Mock::Permanent("CHAT_INVALID".into()),
         Mock::Ok(202),
-    ]);
+    ]));
 
     let tmp = tempfile::tempdir().unwrap();
     let p1 = tmp.path().join("a.out");
@@ -145,8 +143,7 @@ async fn run_one_split_job(
     caption_data: telegram_client::upload::caption::CaptionData,
     upload_script: Vec<Mock>,
 ) -> Vec<(i64, std::path::PathBuf, Option<String>, i64)> {
-    let mock = Arc::new(MockClient::new());
-    mock.script_upload(upload_script);
+    let mock = Arc::new(MockClient::new().script_upload(upload_script));
 
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("big.out");

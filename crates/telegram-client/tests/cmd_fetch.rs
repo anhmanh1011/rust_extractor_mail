@@ -266,7 +266,7 @@ async fn fetch_link_resolves_to_chat_and_msg_id() {
 #[tokio::test]
 async fn fetch_uploads_to_configured_chat_id() {
     let tmp = tempfile::tempdir().unwrap();
-    let mock = Arc::new(MockClient::new().with_document(
+    let mock = MockClient::new().with_document(
         MessageInfo {
             chat_id: 42,
             msg_id: 7,
@@ -276,15 +276,15 @@ async fn fetch_uploads_to_configured_chat_id() {
             date: 0,
         },
         Vec::new(), // bytes unused -- script takes precedence
-    ));
+    );
     mock.script_download(
         42,
         7,
         vec![Ok(Bytes::from_static(b"target.com:alice@x.com:p1\n"))],
     );
-    mock.script_upload(vec![telegram_client::telegram::mock::UploadOutcome::Ok(
-        909,
-    )]);
+    let mock = Arc::new(mock.script_upload(vec![
+        telegram_client::telegram::mock::UploadOutcome::Ok(909),
+    ]));
 
     let mut cfg = cfg(tmp.path());
     cfg.telegram.output.chat = None;
@@ -431,7 +431,7 @@ async fn fetch_does_not_gate_numeric_chat_string() {
     // numeric field is the canonical form, but accepting numeric
     // strings here matches how some configs are templated.
     let tmp = tempfile::tempdir().unwrap();
-    let mock = Arc::new(MockClient::new().with_document(
+    let mock = MockClient::new().with_document(
         MessageInfo {
             chat_id: 1,
             msg_id: 1,
@@ -441,13 +441,15 @@ async fn fetch_does_not_gate_numeric_chat_string() {
             date: 0,
         },
         Vec::new(),
-    ));
+    );
     mock.script_download(
         1,
         1,
         vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
     );
-    mock.script_upload(vec![telegram_client::telegram::mock::UploadOutcome::Ok(7)]);
+    let mock = Arc::new(
+        mock.script_upload(vec![telegram_client::telegram::mock::UploadOutcome::Ok(7)]),
+    );
 
     let mut cfg = cfg(tmp.path());
     cfg.telegram.output.chat = Some("-1001234567890".into());
@@ -475,7 +477,7 @@ async fn fetch_persists_files_row_and_dedupes_on_second_run() {
     use telegram_client::store::{EnqueueResult, Store};
 
     let tmp = tempfile::tempdir().unwrap();
-    let mock = Arc::new(MockClient::new());
+    let mock = MockClient::new();
     mock.set_message(
         42,
         7,
@@ -493,7 +495,9 @@ async fn fetch_persists_files_row_and_dedupes_on_second_run() {
         7,
         vec![Ok(Bytes::from_static(b"target.com:a@a.com:p\n"))],
     );
-    mock.script_upload(vec![telegram_client::telegram::mock::UploadOutcome::Ok(701)]);
+    let mock = Arc::new(
+        mock.script_upload(vec![telegram_client::telegram::mock::UploadOutcome::Ok(701)]),
+    );
 
     let mut cfg = cfg(tmp.path());
     cfg.telegram.output.chat_id = Some(-1001234567890);

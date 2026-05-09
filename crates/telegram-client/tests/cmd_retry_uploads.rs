@@ -42,9 +42,8 @@ async fn drains_pending_failed_uploads_on_success() {
     let store = Store::open(&tmp.path().join("s.db")).unwrap();
     let _ = seed_failed_row(&store, tmp.path(), "aa");
 
-    let mock = Arc::new(MockClient::new());
     let _ = Bytes::new();   // imports check
-    mock.script_upload(vec![Mock::Ok(909)]);
+    let mock = Arc::new(MockClient::new().script_upload(vec![Mock::Ok(909)]));
 
     let target = -1001234567890_i64;
     run_with_store_and_client(&store, mock.as_ref(), &upload_cfg_for_test(target))
@@ -64,8 +63,9 @@ async fn keeps_row_when_retry_fails_permanently() {
     let store = Store::open(&tmp.path().join("s.db")).unwrap();
     let _ = seed_failed_row(&store, tmp.path(), "aa");
 
-    let mock = Arc::new(MockClient::new());
-    mock.script_upload(vec![Mock::Permanent("STILL_BROKEN".into())]);
+    let mock = Arc::new(
+        MockClient::new().script_upload(vec![Mock::Permanent("STILL_BROKEN".into())]),
+    );
 
     let target = -1001234567890_i64;
     let _ = run_with_store_and_client(&store, mock.as_ref(), &upload_cfg_for_test(target)).await;
@@ -88,8 +88,7 @@ async fn retry_renders_caption_from_files_join() {
     let store = Store::open(&tmp.path().join("s.db")).unwrap();
     let _ = seed_failed_row(&store, tmp.path(), "aa");
 
-    let mock = Arc::new(MockClient::new());
-    mock.script_upload(vec![Mock::Ok(910)]);
+    let mock = Arc::new(MockClient::new().script_upload(vec![Mock::Ok(910)]));
 
     let target = -1001234567890_i64;
     run_with_store_and_client(&store, mock.as_ref(), &upload_cfg_for_test(target))

@@ -31,7 +31,7 @@ async fn dropping_jobs_tx_cleanly_shuts_pipeline_down() {
         (info.chat_id, info.msg_id),
         (info.clone(), b"gmail.com:a@b.c:d\n".to_vec()),
     );
-    mock.script_upload(vec![UploadOutcome::Ok(1)]);
+    let mock = mock.script_upload(vec![UploadOutcome::Ok(1)]);
 
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<Job>(2);
     jobs_tx

@@ -41,7 +41,7 @@ async fn pipeline_serializes_under_slow_on_outcome() {
     }
     // Single combined script_upload (FIFO). Use i64::from(msg) for the
     // i32 -> i64 widening per project convention (no `as` casts).
-    mock.script_upload(vec![
+    let mock = mock.script_upload(vec![
         UploadOutcome::Ok(1000 + i64::from(101_i32)),
         UploadOutcome::Ok(1000 + i64::from(102_i32)),
         UploadOutcome::Ok(1000 + i64::from(103_i32)),

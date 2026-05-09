@@ -15,12 +15,11 @@ fn fast_policy() -> RetryPolicy {
 
 #[tokio::test]
 async fn flood_wait_then_success() {
-    let mock = Arc::new(MockClient::new());
-    mock.script_upload(vec![
+    let mock = Arc::new(MockClient::new().script_upload(vec![
         UploadOutcome::FloodWait { seconds: 1 },
         UploadOutcome::FloodWait { seconds: 2 },
         UploadOutcome::Ok(42),
-    ]);
+    ]));
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().join("out.txt");
     std::fs::write(&p, b"hello").unwrap();
@@ -34,10 +33,9 @@ async fn flood_wait_then_success() {
 
 #[tokio::test]
 async fn permanent_error_short_circuits() {
-    let mock = Arc::new(MockClient::new());
-    mock.script_upload(vec![
+    let mock = Arc::new(MockClient::new().script_upload(vec![
         UploadOutcome::Permanent("CHAT_INVALID".into()),
-    ]);
+    ]));
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().join("out.txt");
     std::fs::write(&p, b"x").unwrap();
@@ -52,14 +50,13 @@ async fn permanent_error_short_circuits() {
 
 #[tokio::test]
 async fn budget_exhausted_after_max_attempts_floods() {
-    let mock = Arc::new(MockClient::new());
-    mock.script_upload(vec![
+    let mock = Arc::new(MockClient::new().script_upload(vec![
         UploadOutcome::FloodWait { seconds: 1 },
         UploadOutcome::FloodWait { seconds: 1 },
         UploadOutcome::FloodWait { seconds: 1 },
         UploadOutcome::FloodWait { seconds: 1 },
         UploadOutcome::FloodWait { seconds: 1 },
-    ]);
+    ]));
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().join("out.txt");
     std::fs::write(&p, b"x").unwrap();

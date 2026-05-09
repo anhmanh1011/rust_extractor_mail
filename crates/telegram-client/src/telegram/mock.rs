@@ -66,6 +66,16 @@ pub struct MockClient {
     /// Counts calls to `subscribe_updates`. Tests assert this directly via
     /// [`MockClient::subscribe_calls`] to pin reconnect behavior.
     subscribe_call_count: AtomicUsize,
+    /// Wall-clock delay each `download_stream` producer holds the in-flight
+    /// slot before producing bytes. Default `Duration::ZERO`.
+    download_delay: std::time::Duration,
+    /// Currently-running download producer tasks. `Arc` so the counter can
+    /// be cloned into spawned closures (raw `AtomicUsize` cannot move out of
+    /// `&self`). Bumped on producer entry, decremented on producer drop.
+    inflight_downloads: std::sync::Arc<AtomicUsize>,
+    /// High-water mark of `inflight_downloads` over this mock's lifetime.
+    /// Read via [`MockClient::inflight_observed`].
+    max_inflight_downloads: std::sync::Arc<AtomicUsize>,
 }
 
 impl MockClient {
@@ -82,6 +92,9 @@ impl MockClient {
             history: Mutex::new(HashMap::new()),
             update_batches: Mutex::new(Vec::new()),
             subscribe_call_count: AtomicUsize::new(0),
+            download_delay: std::time::Duration::ZERO,
+            inflight_downloads: std::sync::Arc::new(AtomicUsize::new(0)),
+            max_inflight_downloads: std::sync::Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -121,11 +134,32 @@ impl MockClient {
 
     /// Push a sequence of upload outcomes consumed FIFO by `upload_file`.
     ///
+    /// Chainable builder form (matches `with_dialog` / `with_document`).
     /// Calling this method replaces any prior script. Once the queue is
     /// exhausted, subsequent `upload_file` calls succeed with auto-allocated
     /// ids from the internal monotonic counter.
-    pub fn script_upload(&self, outcomes: Vec<UploadOutcome>) {
+    pub fn script_upload(self, outcomes: Vec<UploadOutcome>) -> Self {
         *self.upload_script.lock().unwrap() = outcomes.into();
+        self
+    }
+
+    /// Configure a wall-clock delay each `download_stream` producer holds the
+    /// in-flight slot before producing bytes. Defaults to `Duration::ZERO`.
+    /// Tests use this to widen the race-window when asserting on
+    /// [`Self::inflight_observed`].
+    pub fn download_delay(mut self, d: std::time::Duration) -> Self {
+        self.download_delay = d;
+        self
+    }
+
+    /// High-water mark of concurrent in-flight `download_stream` producer
+    /// tasks observed over the lifetime of this mock. The counter is bumped
+    /// at the start of each producer task and decremented on its drop, so
+    /// the value reflects the maximum concurrency the orchestrator allowed
+    /// — a regression in `inter_file_channel_capacity` enforcement is
+    /// caught by asserting this is `<= cfg.inter_file_channel_capacity`.
+    pub fn inflight_observed(&self) -> usize {
+        self.max_inflight_downloads.load(Ordering::SeqCst)
     }
 
     /// Builder: append a dialog to the mock's dialog list.
@@ -177,6 +211,38 @@ impl MockClient {
 impl Default for MockClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// RAII bump/decrement on a paired `Arc<AtomicUsize>`; updates `max`
+/// monotonically on bump via a lock-free CAS loop. Owned form (no borrow)
+/// so the guard can be moved into a `tokio::spawn` closure.
+struct InflightGuardOwned {
+    inflight: std::sync::Arc<AtomicUsize>,
+}
+
+impl InflightGuardOwned {
+    fn enter(
+        inflight: &std::sync::Arc<AtomicUsize>,
+        max: &std::sync::Arc<AtomicUsize>,
+    ) -> Self {
+        let now = inflight.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut cur = max.load(Ordering::SeqCst);
+        while now > cur {
+            match max.compare_exchange_weak(cur, now, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(updated) => cur = updated,
+            }
+        }
+        InflightGuardOwned {
+            inflight: inflight.clone(),
+        }
+    }
+}
+
+impl Drop for InflightGuardOwned {
+    fn drop(&mut self) {
+        self.inflight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -240,7 +306,21 @@ impl TelegramClient for MockClient {
 
         if let Some(script) = script {
             let (tx, rx) = mpsc::channel(4);
+            // Clone the Arc'd counters + delay before moving into the spawn
+            // so the guard's lifetime spans the entire producer task — not
+            // just the prelude. See `InflightGuardOwned` doc-comment.
+            let inflight = self.inflight_downloads.clone();
+            let max = self.max_inflight_downloads.clone();
+            let delay = self.download_delay;
             tokio::spawn(async move {
+                // Guard MUST be the first statement so it covers `sleep`
+                // too — otherwise concurrent producers can both be sleeping
+                // outside the guard and `inflight_observed()` would report
+                // 1 even when the orchestrator broke the cap.
+                let _g = InflightGuardOwned::enter(&inflight, &max);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 for item in script {
                     let is_err = item.is_err();
                     if tx.send(item).await.is_err() {
@@ -265,7 +345,14 @@ impl TelegramClient for MockClient {
 
         if let Some(bytes) = bytes {
             let (tx, rx) = mpsc::channel(4);
+            let inflight = self.inflight_downloads.clone();
+            let max = self.max_inflight_downloads.clone();
+            let delay = self.download_delay;
             tokio::spawn(async move {
+                let _g = InflightGuardOwned::enter(&inflight, &max);
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 for chunk in bytes.chunks(1024) {
                     if tx.send(Ok(Bytes::copy_from_slice(chunk))).await.is_err() {
                         break;
