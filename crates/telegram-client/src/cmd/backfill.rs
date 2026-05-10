@@ -78,6 +78,7 @@ pub async fn run(cfg: &AppConfig, secrets: &Secrets, args: &BackfillArgs) -> Res
     )
     .await
     .context("GrammersClient::connect")?;
+    client.set_concurrent_chunks(cfg.telegram.download_concurrent_chunks);
     let store_path = std::path::Path::new(&cfg.pipeline.work_dir).join("state.db");
     let store = Store::open(&store_path)
         .with_context(|| format!("open store {}", store_path.display()))?;
@@ -214,7 +215,33 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         let msg_id  = o.job.source_msg_id;
         let title   = format!("chat:{chat_id}");
         match &o.kind {
-            OutcomeKind::Uploaded { .. } | OutcomeKind::Deduped { .. } => {
+            OutcomeKind::Uploaded { sha256, output_msg_ids } => {
+                // files.output_msg_id holds the head part — same convention as
+                // cmd::fetch (see fetch.rs:532-545 for the multi-part rationale).
+                let head = output_msg_ids.first().copied().unwrap_or_else(|| {
+                    tracing::error!(
+                        %sha256,
+                        "Uploaded outcome had empty output_msg_ids; recording 0",
+                    );
+                    0
+                });
+                if let Err(e) = cb_store.mark_uploaded(sha256, head) {
+                    tracing::error!(?e, %sha256, "backfill: mark_uploaded failed");
+                }
+                if let Err(e) =
+                    cb_store.advance_backfill(chat_id, &title, i64::from(msg_id))
+                {
+                    tracing::error!(
+                        ?e,
+                        chat_id,
+                        msg_id,
+                        "backfill: advance_backfill failed",
+                    );
+                }
+            }
+            OutcomeKind::Deduped { .. } => {
+                // Dedup means the prior run already wrote files.status='done';
+                // no mark_uploaded needed.
                 if let Err(e) =
                     cb_store.advance_backfill(chat_id, &title, i64::from(msg_id))
                 {

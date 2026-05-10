@@ -219,7 +219,34 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         let chat_id = o.job.source_chat_id;
         let msg_id  = o.job.source_msg_id;
         match &o.kind {
-            OutcomeKind::Uploaded { .. } | OutcomeKind::Deduped { .. } => {
+            OutcomeKind::Uploaded { sha256, output_msg_ids } => {
+                // files.output_msg_id holds the head part — same convention as
+                // cmd::fetch (see fetch.rs:532-545 for the multi-part rationale).
+                let head = output_msg_ids.first().copied().unwrap_or_else(|| {
+                    tracing::error!(
+                        %sha256,
+                        "Uploaded outcome had empty output_msg_ids; recording 0",
+                    );
+                    0
+                });
+                if let Err(e) = cb_store.mark_uploaded(sha256, head) {
+                    tracing::error!(?e, %sha256, "watch: mark_uploaded failed");
+                }
+                let title = format!("chat:{chat_id}");
+                if let Err(e) =
+                    cb_store.update_watch_cursor(chat_id, &title, i64::from(msg_id))
+                {
+                    tracing::error!(
+                        ?e,
+                        chat_id,
+                        msg_id,
+                        "watch: failed to advance cursor",
+                    );
+                }
+            }
+            OutcomeKind::Deduped { .. } => {
+                // Dedup means the prior run already wrote files.status='done';
+                // no mark_uploaded needed.
                 let title = format!("chat:{chat_id}");
                 if let Err(e) =
                     cb_store.update_watch_cursor(chat_id, &title, i64::from(msg_id))

@@ -3,16 +3,21 @@
 use super::{ChatRef, Dialog, DialogKind, MessageInfo, TelegramClient};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
-use grammers_client::types::{Chat, Media};
+use grammers_client::types::{Chat, Downloadable, Media};
 use grammers_client::{Client, Config, InitParams, SignInError};
 use grammers_session::Session;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::mpsc;
 
 /// Real grammers-backed client. Construct via [`GrammersClient::connect`].
 pub struct GrammersClient {
     pub(crate) client: Client,
     pub(crate) session_path: PathBuf,
+    /// Number of parallel chunk downloaders for `download_stream`. Default 1
+    /// (sequential, matches grammers' `iter_download` behaviour). Bumped via
+    /// [`GrammersClient::set_concurrent_chunks`] from `cfg.telegram.download_concurrent_chunks`.
+    pub(crate) concurrent_chunks: AtomicUsize,
 }
 
 impl GrammersClient {
@@ -40,7 +45,16 @@ impl GrammersClient {
         Ok(Self {
             client,
             session_path: session_path.into(),
+            concurrent_chunks: AtomicUsize::new(1),
         })
+    }
+
+    /// Number of parallel chunk downloaders to spawn in `download_stream`.
+    /// Clamped to `1..=8` to bound peak memory (each worker holds up to
+    /// 2 × 512 KiB inflight) and avoid hammering a single DC. `0` becomes 1.
+    pub fn set_concurrent_chunks(&self, n: usize) {
+        let clamped = n.clamp(1, 8);
+        self.concurrent_chunks.store(clamped, Ordering::Relaxed);
     }
 
     /// Sign in with a phone number; returns `Ok(())` once the session is authorized.
@@ -210,7 +224,17 @@ impl TelegramClient for GrammersClient {
     ) -> Result<mpsc::Receiver<Result<Bytes>>> {
         use anyhow::Context as _;
 
-        // 1. Resolve message to media reference.
+        // grammers' `MAX_CHUNK_SIZE` (`grammers-client/src/client/files.rs`).
+        // We replicate the constant locally because the upstream module is
+        // private. Each `iter_download.next()` returns up to this many bytes.
+        const CHUNK_SIZE: i32 = 512 * 1024;
+        // Files smaller than this stick with a single sequential worker —
+        // splitting offers no win when total chunks ≈ workers and the
+        // parallel fan-out adds overhead. Matches grammers' own
+        // `BIG_FILE_SIZE` heuristic (10 MiB).
+        const PARALLEL_THRESHOLD: u64 = 10 * 1024 * 1024;
+
+        // 1. Resolve message to media reference + size for offset planning.
         let chat = self
             .chat_handle(chat_id)
             .await
@@ -229,22 +253,90 @@ impl TelegramClient for GrammersClient {
             .media()
             .ok_or_else(|| anyhow!("message {msg_id} has no media"))?;
 
-        // 2. Wrap Media → Downloadable and build the grammers chunk iterator.
-        //    Then convert to a futures::Stream via unfold so pump_chunks can
-        //    drive it without capturing a mutable reference across closure calls.
-        let downloadable = grammers_client::types::Downloadable::Media(media);
-        let dl = self.client.iter_download(&downloadable);
+        let size_bytes: u64 = match &media {
+            Media::Document(d) => u64::try_from(d.size()).unwrap_or(0),
+            _ => 0,
+        };
 
-        let chunk_stream = futures::stream::unfold(dl, |mut iter| async move {
-            match iter.next().await {
-                Ok(Some(chunk)) => Some((Ok(Bytes::from(chunk)), iter)),
-                Ok(None) => None,
-                Err(e) => Some((Err(anyhow::anyhow!("grammers iter_download: {e}")), iter)),
+        let downloadable = Downloadable::Media(media);
+        let n_workers = self.concurrent_chunks.load(Ordering::Relaxed).max(1);
+        let (tx, rx) = mpsc::channel(crate::telegram::download::INTRA_FILE_CAP);
+
+        // Single-worker fast path: small file, unknown size, or N=1.
+        if n_workers == 1 || size_bytes < PARALLEL_THRESHOLD {
+            let dl = self.client.iter_download(&downloadable);
+            let chunk_stream = futures::stream::unfold(dl, |mut iter| async move {
+                match iter.next().await {
+                    Ok(Some(chunk)) => Some((Ok(Bytes::from(chunk)), iter)),
+                    Ok(None) => None,
+                    Err(e) => Some((Err(anyhow!("grammers iter_download: {e}")), iter)),
+                }
+            });
+            tokio::spawn(crate::telegram::download::pump_chunks(tx, chunk_stream));
+            return Ok(rx);
+        }
+
+        // Parallel path: split into N contiguous offset windows. Each worker
+        // owns its own DownloadIter (cheap — clones the inner Arc'd Client)
+        // and pushes its chunks into a per-worker bounded mpsc. The joiner
+        // drains worker-0 fully before worker-1, so emitted chunks remain in
+        // strict offset order — required by `Scanner` for line stitching.
+        let total_chunks: usize = ((size_bytes + (CHUNK_SIZE as u64) - 1)
+            / (CHUNK_SIZE as u64)) as usize;
+        let chunks_per_worker = total_chunks.div_ceil(n_workers);
+
+        let mut worker_rxs: Vec<mpsc::Receiver<Result<Bytes>>> = Vec::with_capacity(n_workers);
+        for i in 0..n_workers {
+            let start = i * chunks_per_worker;
+            if start >= total_chunks {
+                break;
+            }
+            let count = std::cmp::min(chunks_per_worker, total_chunks - start);
+            let mut dl = self
+                .client
+                .iter_download(&downloadable)
+                .chunk_size(CHUNK_SIZE);
+            if start > 0 {
+                let skip = i32::try_from(start)
+                    .with_context(|| format!("skip_chunks {start} overflows i32"))?;
+                dl = dl.skip_chunks(skip);
+            }
+            let (wtx, wrx) = mpsc::channel::<Result<Bytes>>(2);
+            tokio::spawn(async move {
+                for _ in 0..count {
+                    match dl.next().await {
+                        Ok(Some(chunk)) => {
+                            if wtx.send(Ok(Bytes::from(chunk))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            let _ = wtx
+                                .send(Err(anyhow!("grammers iter_download: {e}")))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            });
+            worker_rxs.push(wrx);
+        }
+
+        tokio::spawn(async move {
+            'outer: for mut wrx in worker_rxs {
+                while let Some(item) = wrx.recv().await {
+                    let is_err = item.is_err();
+                    if tx.send(item).await.is_err() {
+                        break 'outer;
+                    }
+                    if is_err {
+                        break 'outer;
+                    }
+                }
             }
         });
 
-        let (tx, rx) = mpsc::channel(crate::telegram::download::INTRA_FILE_CAP);
-        tokio::spawn(crate::telegram::download::pump_chunks(tx, chunk_stream));
         Ok(rx)
     }
 

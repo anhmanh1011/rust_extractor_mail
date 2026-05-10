@@ -46,6 +46,7 @@ async fn main() -> Result<()> {
             )
             .await
             .context("GrammersClient::connect")?;
+            client.set_concurrent_chunks(cfg.telegram.download_concurrent_chunks);
             telegram_client::cmd::fetch::run_with_store_and_client(&cfg, &args, &client, Some(&store)).await
         }
         Cmd::Watch(args)           => {
@@ -56,6 +57,7 @@ async fn main() -> Result<()> {
             )
             .await
             .context("GrammersClient::connect")?;
+            client.set_concurrent_chunks(cfg.telegram.download_concurrent_chunks);
             telegram_client::cmd::watch::run_with_store_and_client(&cfg, &args, &client, &store).await
         }
         Cmd::Backfill(args)        => telegram_client::cmd::backfill::run(&cfg, &secrets, &args).await,
