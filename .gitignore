@@ -14,7 +14,10 @@ session.session
 # Local artefacts
 /out/
 /work_dir/
+/work/
+/logs/
 *.log
+*.log.*
 *.tmp
 *.txt
 *.out
