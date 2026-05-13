@@ -252,10 +252,24 @@ pub async fn download_stage<C: TelegramClient + ?Sized>(
         let chat = job.source_chat_id;
         let msg  = job.source_msg_id;
 
+        tracing::info!(
+            chat_id = chat,
+            msg_id = msg,
+            name = %job.info.original_name,
+            size_bytes = job.info.size_bytes,
+            "stage1.download: starting",
+        );
+        let t_stage = std::time::Instant::now();
+
         // Open stream + peek first chunk for format detection.
         let mut chunks_in = match client.download_stream(chat, msg).await {
             Ok(rx) => rx,
             Err(e) => {
+                tracing::warn!(
+                    chat_id = chat, msg_id = msg,
+                    error = %format!("{e:#}"),
+                    "stage1.download: download_stream failed",
+                );
                 if s1_tx.send(Stage1Out::Failed { job, error: e.context("download_stream") })
                     .await.is_err()
                 {
@@ -264,9 +278,15 @@ pub async fn download_stage<C: TelegramClient + ?Sized>(
                 continue;
             }
         };
+        let t_first = std::time::Instant::now();
         let first = match chunks_in.recv().await {
             Some(Ok(b)) => b,
             Some(Err(e)) => {
+                tracing::warn!(
+                    chat_id = chat, msg_id = msg,
+                    error = %format!("{e:#}"),
+                    "stage1.download: first chunk failed",
+                );
                 if s1_tx.send(Stage1Out::Failed { job, error: e.context("first chunk") })
                     .await.is_err()
                 {
@@ -277,10 +297,25 @@ pub async fn download_stage<C: TelegramClient + ?Sized>(
             None => Bytes::new(),
         };
         let format = detect_format(&job.info.original_name, &first);
+        tracing::info!(
+            chat_id = chat, msg_id = msg,
+            format = ?format,
+            first_chunk_bytes = first.len(),
+            first_chunk_ms = t_first.elapsed().as_millis() as u64,
+            "stage1.download: format detected",
+        );
 
         let send_res = match format {
             Format::Txt | Format::Gz => {
                 let is_gzip = matches!(format, Format::Gz);
+                // Stream variant: actual byte-pull happens inside Stage 2's tee,
+                // so we cannot time the full download here. Stage 2 will log
+                // throughput once the stream is drained.
+                tracing::info!(
+                    chat_id = chat, msg_id = msg,
+                    stage1_handoff_ms = t_stage.elapsed().as_millis() as u64,
+                    "stage1.download: handing off Stream variant to extract",
+                );
                 s1_tx.send(Stage1Out::Stream {
                     job, format, is_gzip,
                     first_chunk: first,
@@ -294,16 +329,40 @@ pub async fn download_stage<C: TelegramClient + ?Sized>(
                     &label,
                     Some(job.info.size_bytes),
                 );
+                let t_drain = std::time::Instant::now();
                 let drain_res = drain_to_tempfile(first, chunks_in, &pb).await;
                 pb.finish_and_clear();
                 match drain_res {
-                    Ok(temp) => s1_tx.send(Stage1Out::Disk { job, format, temp }).await,
-                    Err(e)   => s1_tx.send(Stage1Out::Failed {
-                        job, error: e.context("download zip → tempfile"),
-                    }).await,
+                    Ok(temp) => {
+                        let bytes = std::fs::metadata(temp.path()).map(|m| m.len()).unwrap_or(0);
+                        let elapsed_ms = t_drain.elapsed().as_millis() as u64;
+                        tracing::info!(
+                            chat_id = chat, msg_id = msg,
+                            bytes,
+                            elapsed_ms,
+                            kbps = throughput_kbps(bytes, elapsed_ms),
+                            "stage1.download: zip drained to tempfile",
+                        );
+                        s1_tx.send(Stage1Out::Disk { job, format, temp }).await
+                    },
+                    Err(e)   => {
+                        tracing::warn!(
+                            chat_id = chat, msg_id = msg,
+                            error = %format!("{e:#}"),
+                            "stage1.download: zip drain failed",
+                        );
+                        s1_tx.send(Stage1Out::Failed {
+                            job, error: e.context("download zip → tempfile"),
+                        }).await
+                    }
                 }
             }
             Format::Unknown => {
+                tracing::warn!(
+                    chat_id = chat, msg_id = msg,
+                    name = %job.info.original_name,
+                    "stage1.download: unknown format, marking failed",
+                );
                 s1_tx.send(Stage1Out::Failed {
                     job,
                     error: anyhow::anyhow!("unknown format (extension + magic both inconclusive)"),
@@ -316,6 +375,13 @@ pub async fn download_stage<C: TelegramClient + ?Sized>(
         }
     }
     Ok(())
+}
+
+/// KiB/s throughput from `bytes` over `elapsed_ms`. Returns 0 when elapsed is
+/// zero to avoid div-by-zero in log fields.
+fn throughput_kbps(bytes: u64, elapsed_ms: u64) -> u64 {
+    if elapsed_ms == 0 { return 0; }
+    (bytes * 1000) / (elapsed_ms * 1024)
 }
 
 async fn drain_to_tempfile(
@@ -420,6 +486,12 @@ async fn handle_stream(
     first_chunk: Bytes,
     mut chunks:  mpsc::Receiver<anyhow::Result<Bytes>>,
 ) -> Stage2Out {
+    let t_stage = std::time::Instant::now();
+    tracing::info!(
+        chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+        is_gzip,
+        "stage2.extract: starting (stream)",
+    );
     let (out_path, chat_dir) = match build_output_path(cfg, &job) {
         Ok(p)  => p,
         Err(e) => return Stage2Out::Failed { job, error: e },
@@ -502,6 +574,18 @@ async fn handle_stream(
         }
     }
 
+    let elapsed_ms = t_stage.elapsed().as_millis() as u64;
+    tracing::info!(
+        chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+        sha256 = %sha,
+        lines_scanned = stats.lines_scanned,
+        lines_matched = stats.lines_matched,
+        bytes_scanned = stats.bytes_scanned,
+        elapsed_ms,
+        kbps = throughput_kbps(stats.bytes_scanned, elapsed_ms),
+        out = %out_path.display(),
+        "stage2.extract: done (stream)",
+    );
     Stage2Out::Ready {
         job, sha256: sha, output_path: out_path,
         lines_scanned: stats.lines_scanned,
@@ -518,6 +602,12 @@ async fn handle_disk(
     temp:    tempfile::NamedTempFile,
 ) -> Stage2Out {
     use std::io::Read;
+    let t_stage = std::time::Instant::now();
+    tracing::info!(
+        chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+        spill = %temp.path().display(),
+        "stage2.extract: starting (disk/zip)",
+    );
 
     // 1. Hash the spilled compressed bytes for file-level dedup. The
     //    compressed stream is the canonical identity here — two zips
@@ -635,6 +725,18 @@ async fn handle_disk(
 
     // 6. RAII drop of `temp` deletes the spill at function return.
     drop(temp);
+    let elapsed_ms = t_stage.elapsed().as_millis() as u64;
+    tracing::info!(
+        chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+        sha256 = %sha,
+        lines_scanned = stats.lines_scanned,
+        lines_matched = stats.lines_matched,
+        bytes_scanned = stats.bytes_scanned,
+        elapsed_ms,
+        kbps = throughput_kbps(stats.bytes_scanned, elapsed_ms),
+        out = %out_path.display(),
+        "stage2.extract: done (disk/zip)",
+    );
     Stage2Out::Ready {
         job,
         sha256: sha,
@@ -747,12 +849,23 @@ pub async fn upload_stage<C: TelegramClient + ?Sized>(
     while let Some(s2) = s2_rx.recv().await {
         match s2 {
             Stage2Out::Failed { job, error } => {
+                tracing::warn!(
+                    chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+                    name = %job.info.original_name,
+                    error = %format!("{error:#}"),
+                    "stage3.upload: skipping (upstream failed)",
+                );
                 on_outcome(JobOutcome {
                     job,
                     kind: OutcomeKind::Failed { error: format!("{error:#}") },
                 });
             }
             Stage2Out::Deduped { job, sha256 } => {
+                tracing::info!(
+                    chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+                    sha256 = %sha256,
+                    "stage3.upload: skipping (deduped upstream)",
+                );
                 on_outcome(JobOutcome {
                     job,
                     kind: OutcomeKind::Deduped { sha256 },
@@ -762,6 +875,14 @@ pub async fn upload_stage<C: TelegramClient + ?Sized>(
                 job, sha256, output_path,
                 lines_scanned, lines_matched, format: _format,
             } => {
+                let t_upload = std::time::Instant::now();
+                let out_bytes = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+                tracing::info!(
+                    chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+                    sha256 = %sha256,
+                    out_bytes,
+                    "stage3.upload: starting",
+                );
                 // Upload bar: presence signals "this file is mid-upload",
                 // length is the prepared output size. The grammers v0.7
                 // upload API does not expose a per-chunk callback, so the
@@ -839,12 +960,30 @@ pub async fn upload_stage<C: TelegramClient + ?Sized>(
                     continue;
                 }
                 let kind = match outcome_opt {
-                    Some(UploadOutcome::Done { sha256, output_msg_ids }) =>
-                        OutcomeKind::Uploaded { sha256, output_msg_ids },
-                    Some(UploadOutcome::Skipped { sha256, reason }) =>
+                    Some(UploadOutcome::Done { sha256, output_msg_ids }) => {
+                        let elapsed_ms = t_upload.elapsed().as_millis() as u64;
+                        tracing::info!(
+                            chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+                            sha256 = %sha256,
+                            parts = output_msg_ids.len(),
+                            ?output_msg_ids,
+                            elapsed_ms,
+                            kbps = throughput_kbps(out_bytes, elapsed_ms),
+                            "stage3.upload: done",
+                        );
+                        OutcomeKind::Uploaded { sha256, output_msg_ids }
+                    },
+                    Some(UploadOutcome::Skipped { sha256, reason }) => {
+                        tracing::warn!(
+                            chat_id = job.source_chat_id, msg_id = job.source_msg_id,
+                            sha256 = %sha256,
+                            reason = %reason,
+                            "stage3.upload: skipped by uploader",
+                        );
                         OutcomeKind::Failed {
                             error: format!("upload skipped ({reason}) for {sha256}"),
-                        },
+                        }
+                    },
                     None => {
                         // `out_tx` was dropped without a `Done`/`Skipped` send.
                         // That can only happen via the `on_failed` path inside

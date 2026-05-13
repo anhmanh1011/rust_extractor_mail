@@ -160,10 +160,15 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
 ) -> Result<()> {
     use crate::pipeline::interfile::{self, CursorAdvance, Job, JobOutcome, OutcomeKind};
 
+    let t_warm = std::time::Instant::now();
     client
         .connect_and_warm()
         .await
         .context("connect_and_warm")?;
+    tracing::info!(
+        elapsed_ms = t_warm.elapsed().as_millis() as u64,
+        "watch: client connected and warmed",
+    );
 
     // 1. Resolve the configured chat list to numeric chat ids.
     if cfg.watch.channels.is_empty() {
@@ -209,6 +214,19 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
     let mut pcfg = pipeline_config_from_app(cfg, target_chat_id);
     pcfg.progress = make_progress_if_tty();
     let (jobs_tx, jobs_rx) = tokio::sync::mpsc::channel::<Job>(2);
+
+    tracing::info!(
+        watch_channels = chat_ids.len(),
+        ?chat_ids,
+        target_chat_id,
+        mode = %pcfg.matcher_mode,
+        domain = %pcfg.matcher_key,
+        download_concurrent_chunks = cfg.telegram.download_concurrent_chunks,
+        inter_file_cap = pcfg.inter_file_channel_capacity,
+        upload_cap = pcfg.upload_channel_capacity,
+        upload_rate_seconds = pcfg.upload_rate_seconds,
+        "watch: pipeline configured, starting orchestrator + feeder",
+    );
 
     // 4. CursorAdvance callback: persist watch_cursor on every outcome,
     //    record dead_letter on Failed. Advances the cursor past Failed
@@ -312,9 +330,12 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
                 .watch_cursor(chat_id)
                 .with_context(|| format!("watch_cursor chat={chat_id}"))?
                 .unwrap_or(0);
+            let t_gap = std::time::Instant::now();
+            tracing::info!(chat_id, cursor, "watch: gap-fill starting");
             let page_size = cfg.backfill.page_size.max(1);
             let mut next_max: Option<i32> = None;
             let mut stack: Vec<crate::telegram::MessageInfo> = Vec::new();
+            let mut pages_fetched: u32 = 0;
             loop {
                 let page = client
                     .iter_history(chat_id, next_max, page_size)
@@ -322,6 +343,7 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
                     .with_context(|| {
                         format!("gap-fill iter_history chat={chat_id} max={next_max:?}")
                     })?;
+                pages_fetched += 1;
                 if page.is_empty() {
                     break;
                 }
@@ -338,6 +360,15 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
                 }
                 next_max = page.last().map(|m| m.msg_id);
             }
+            let enqueued = stack.len();
+            tracing::info!(
+                chat_id,
+                cursor,
+                pages_fetched,
+                enqueued,
+                elapsed_ms = t_gap.elapsed().as_millis() as u64,
+                "watch: gap-fill discovered, draining into pipeline",
+            );
             stack.reverse();
             for info in stack {
                 let job = Job {
@@ -351,6 +382,7 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
                 }
             }
         }
+        tracing::info!("watch: gap-fill complete for all channels, entering live mode");
 
         // 5b. Live updates with reconnect. Each scripted/live message becomes
         //     a Job pushed onto jobs_tx. On send error (orchestrator hung
@@ -362,6 +394,13 @@ pub async fn run_with_store_and_client<C: TelegramClient>(
         subscribe_with_reconnect(client, &chat_ids, deadline, |info| {
             let tx = jobs_tx_for_live.clone();
             async move {
+                tracing::info!(
+                    chat_id = info.chat_id,
+                    msg_id = info.msg_id,
+                    name = %info.original_name,
+                    size_bytes = info.size_bytes,
+                    "watch: live message received, enqueueing job",
+                );
                 let job = Job {
                     source_chat_id: info.chat_id,
                     source_msg_id:  info.msg_id,
